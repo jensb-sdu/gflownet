@@ -96,7 +96,7 @@ class Scrabble(GFlowNetEnv):
         # Base class init
         super().__init__(**kwargs)
 
-    def get_action_space(self) -> List[Tuple]:
+    def get_action_space(self) -> TensorType["action_space_dim", "action_dim"]:
         """
         Constructs list with all possible actions, including eos.
 
@@ -106,13 +106,13 @@ class Scrabble(GFlowNetEnv):
         The action space of this parent class is:
             action_space: [(0,), (1,), (-1,)]
         """
-        return [(self.token2idx[token],) for token in self.letters] + [(self.eos_idx,)]
+        return torch.tensor([self.token2idx[token] for token in self.letters] + [self.eos_idx], device=self.device)
 
     def get_mask_invalid_actions_forward(
         self,
-        state: Optional[List[int]] = None,
+        state: Union[List[int], List[int]] = None,
         done: Optional[bool] = None,
-    ) -> List[bool]:
+    ) -> TensorType["action_space_dim"]:
         """
         Returns a list of length the action space with values:
             - True if the forward action is invalid from the current state.
@@ -133,12 +133,12 @@ class Scrabble(GFlowNetEnv):
         state = self._get_state(state)
         done = self._get_done(done)
         if done:
-            return [True for _ in range(self.action_space_dim)]
+            return torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
         # If sequence is not at maximum length, all actions are valid
         if state[-1] == self.pad_idx:
-            return [False for _ in range(self.action_space_dim)]
+            return torch.zeros(self.action_space_dim, dtype=torch.bool, device=self.device)
         # Otherwise, only EOS is valid
-        mask = [True for _ in range(self.action_space_dim)]
+        mask = torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
         mask[self.action_space.index(self.eos)] = False
         return mask
 

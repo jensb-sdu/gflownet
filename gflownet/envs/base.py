@@ -68,9 +68,7 @@ class GFlowNetEnv:
         # Action space
         self.action_space = self.get_action_space()
         self._action2index = {a: idx for idx, a in enumerate(self.action_space)}
-        self.action_space_torch = torch.tensor(
-            self.action_space, device=self.device, dtype=self.float
-        )
+
         # Mask dimensionality
         self._mask_dim = self._compute_mask_dim()
         # Max trajectory length
@@ -84,11 +82,11 @@ class GFlowNetEnv:
         self.policy_input_dim = len(self.state2policy())
 
     @abstractmethod
-    def get_action_space(self):
+    def get_action_space(self) -> Union[TensorType["action_space_dim", "action_dim"], List]:
         """
         Constructs list with all possible actions (excluding end of sequence)
         """
-        pass
+        return None
 
     @property
     def action_space_dim(self) -> int:
@@ -99,7 +97,7 @@ class GFlowNetEnv:
         -------
         The number of actions in the action space.
         """
-        return len(self.action_space)
+        return self.action_space.size(dim=0)
 
     @property
     def mask_dim(self):
@@ -195,7 +193,7 @@ class GFlowNetEnv:
         Returns the corresponding indices in the action space of the actions in a batch.
         """
         # Expand the action_space tensor: [batch_size, d_actions_space, action_dim]
-        action_space = torch.unsqueeze(self.action_space_torch, 0).expand(
+        action_space = torch.unsqueeze(self.action_space, 0).expand(
             actions.shape[0], -1, -1
         )
         # Expand the actions tensor: [batch_size, d_actions_space, action_dim]
@@ -266,7 +264,7 @@ class GFlowNetEnv:
 
     def get_mask_invalid_actions_forward(
         self,
-        state: Optional[List] = None,
+        state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
     ) -> List:
         """
@@ -276,11 +274,11 @@ class GFlowNetEnv:
         For continuous or hybrid environments, this mask corresponds to the discrete
         part of the action space.
         """
-        return [False for _ in range(self.action_space_dim)]
+        return torch.zeros(self.action_space_dim) # [False for _ in range(self.action_space_dim)]
 
     def get_mask_invalid_actions_backward(
         self,
-        state: Optional[List] = None,
+        state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
         parents_a: Optional[List] = None,
     ) -> List:
@@ -300,14 +298,14 @@ class GFlowNetEnv:
         done = self._get_done(done)
         if parents_a is None:
             _, parents_a = self.get_parents(state, done)
-        mask = [True for _ in range(self.action_space_dim)]
+        mask = torch.ones(self.action_space_dim, dtype=torch.bool)
         for pa in parents_a:
             mask[self.action_space.index(pa)] = False
         return mask
 
     def get_mask(
         self,
-        state: Optional[List] = None,
+        state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
         backward: Optional[bool] = False,
     ) -> List:
@@ -324,10 +322,10 @@ class GFlowNetEnv:
     def get_valid_actions(
         self,
         mask: Optional[bool] = None,
-        state: Optional[List] = None,
+        state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
         backward: Optional[bool] = False,
-    ) -> List[Tuple]:
+    ) -> TensorType:
         """
         Returns the list of non-invalid (valid, for short) according to the mask of
         invalid actions.
@@ -337,14 +335,14 @@ class GFlowNetEnv:
         """
         if mask is None:
             mask = self.get_mask(state, done, backward)
-        return [action for action, m in zip(self.action_space, mask) if not m]
+        return self.action_space[~torch.tensor(mask, dtype=torch.bool, device=self.device)]
 
     def get_parents(
         self,
-        state: Optional[List] = None,
+        state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
         action: Optional[Tuple] = None,
-    ) -> Tuple[List, List]:
+    ) -> Tuple[Union[List, TensorType["state_dims"]], Union[List, TensorType["state_dims"]]]:
         """
         Determines all parents and actions that lead to state.
 
@@ -409,7 +407,7 @@ class GFlowNetEnv:
             Action index
         """
         # If action not found in action space raise an error
-        if action not in self.action_space:
+        if not self.action_space.isin(action).any():
             raise ValueError(
                 f"Tried to execute action {action} not present in action space."
             )
@@ -638,7 +636,7 @@ class GFlowNetEnv:
         # Sample actions from the Categorical distributions defined by the logits
         action_indices = Categorical(logits=logits_sampling).sample()
         # Build actions
-        actions = [self.action_space[idx] for idx in action_indices]
+        actions = self.action_space[action_indices]
         return actions
 
     def get_logprobs(
