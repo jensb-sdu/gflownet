@@ -375,17 +375,17 @@ class Scrabble(GFlowNetEnv):
             Random seed.
         """
         n_letters = len(self.letters)
-        n_per_length = tlong(
-            [n_letters**length for length in range(1, self.max_length + 1)],
-            device=self.device,
+        n_per_length = n_letters ** torch.arange(
+            1, self.max_length + 1, dtype=torch.long, device=self.device
         )
-        lengths = Categorical(logits=n_per_length.repeat(n_states, 1)).sample() + 1
+        lengths = Categorical(logits=n_per_length.repeat(n_states, 1), device = self.device).sample() + 1
         samples = torch.randint(
-            low=1, high=n_letters + 1, size=(n_states, self.max_length)
+            low=1, high=n_letters + 1, size=(n_states, self.max_length), device=self.device
         )
-        for idx, length in enumerate(lengths):
-            samples[idx, length:] = 0
-        return samples.tolist()
+        positions = torch.arange(self.max_length, device=self.device).unsqueeze(0)
+        mask = positions >= lengths.unsqueeze(1)
+        samples.masked_fill_(mask, 0)
+        return samples
 
     def _pad(self, seq_list: list):
         """
@@ -402,7 +402,7 @@ class Scrabble(GFlowNetEnv):
         """
         return seq_list + [self.pad_idx] * (self.max_length - len(seq_list))
 
-    def _unpad(self, seq_list: list):
+    def _unpad(self, state: TensorType):
         """
         Removes the padding from the end off a sequence represented as a list of
         indices.
@@ -417,11 +417,15 @@ class Scrabble(GFlowNetEnv):
         -------
         The input list padded by the end with self.pad_idx.
         """
+        if torch.is_tensor(state):
+            seq_list = state.flatten().tolist()
+
+
         if self.pad_idx not in seq_list:
             return seq_list
         return seq_list[: seq_list.index(self.pad_idx)]
 
-    def _get_seq_length(self, state: List[int] = None):
+    def _get_seq_length(self, state: TensorType["state_dim"] = None):
         """
         Returns the effective length of a state, that is ignoring the padding.
 

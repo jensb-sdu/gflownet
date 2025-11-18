@@ -375,7 +375,7 @@ class GFlowNetEnv:
 
     def get_valid_actions(
         self,
-        mask: Optional[bool] = None,
+        mask: Optional[TensorType["state_space_dim"]] = None,
         state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
         backward: Optional[bool] = False,
@@ -389,7 +389,7 @@ class GFlowNetEnv:
         """
         if mask is None:
             mask = self.get_mask(state, done, backward)
-        return self.action_space[~torch.tensor(mask, dtype=torch.bool, device=self.device)].detach().clone()
+        return self.action_space[~mask].detach().clone()
 
     def get_parents(
         self,

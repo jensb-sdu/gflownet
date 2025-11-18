@@ -201,7 +201,7 @@ class GFlowNetAgent:
         # Evaluator
         self.evaluator = evaluator
         self.evaluator.set_agent(self)
-
+        optimizer.n_train_steps = 100
         self.n_train_steps = optimizer.n_train_steps
         self.batch_size = optimizer.batch_size
         self.batch_size_total = sum(self.batch_size.values())
