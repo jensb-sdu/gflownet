@@ -85,16 +85,29 @@ class Scrabble(GFlowNetEnv):
         self.max_length = max_length
         self.eos_idx = -1
         self.pad_idx = 0
-        # Dictionaries
-        self.idx2token = {idx + 1: token for idx, token in enumerate(self.letters)}
-        self.idx2token[self.pad_idx] = pad_token
-        self.token2idx = {token: idx for idx, token in self.idx2token.items()}
+        # Dictionaries / tensor representations
+        # Keep a python list for readable token lookup (strings can't be stored in a numeric tensor)
+        self.idx2token = [self.pad_token] + list(self.letters)  # index -> token string
+
+        # Fast python lookup from token->index (used when converting readable -> state)
+        self.token2idx = {token: idx for idx, token in enumerate(self.idx2token)}
+
+        # Torch tensors for numeric operations: indices 0..n_letters
+        self.idx2token_idx = torch.arange(len(self.idx2token), dtype=torch.long)
+        # tensor of token indices in the same order as idx2token (useful for batch ops)
+        self.token_idxs = torch.tensor([self.token2idx[t] for t in self.idx2token], dtype=torch.long)
+
         # Source state: list of length max_length filled with pad token
-        self.source = [self.pad_idx] * self.max_length
+        self.source = torch.tensor([[self.pad_idx]] * self.max_length)
         # End-of-sequence action
-        self.eos = (self.eos_idx,)
+        self.eos = torch.tensor([[self.eos_idx]])
         # Base class init
         super().__init__(**kwargs)
+        self.source = self.source.to(self.device)
+        self.token_idxs = self.token_idxs.to(self.device)
+        self.eos = self.eos.to(self.device)
+        self.idx2token_idx = self.idx2token_idx.to(self.device)
+
 
     def get_action_space(self) -> TensorType["action_space_dim", "action_dim"]:
         """
@@ -106,7 +119,7 @@ class Scrabble(GFlowNetEnv):
         The action space of this parent class is:
             action_space: [(0,), (1,), (-1,)]
         """
-        return torch.tensor([self.token2idx[token] for token in self.letters] + [self.eos_idx], device=self.device)
+        return torch.tensor([[self.token2idx[token]] for token in self.letters] + [[self.eos_idx]], device=self.device)
 
     def get_mask_invalid_actions_forward(
         self,
@@ -135,19 +148,21 @@ class Scrabble(GFlowNetEnv):
         if done:
             return torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
         # If sequence is not at maximum length, all actions are valid
-        if state[-1] == self.pad_idx:
+        if (state == self.pad_idx).any():
             return torch.zeros(self.action_space_dim, dtype=torch.bool, device=self.device)
         # Otherwise, only EOS is valid
         mask = torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
-        mask[self.action_space.index(self.eos)] = False
+        mask[-1] = False
+        if ~mask.any():
+            raise ValueError("No valid actions found, there is likely a bug.")
         return mask
 
     def get_parents(
         self,
-        state: Optional[List[int]] = None,
+        state: Optional[TensorType["state_dim", "action_dim"]] = None,
         done: Optional[bool] = None,
-        action: Optional[Tuple] = None,
-    ) -> Tuple[List, List]:
+        action: Optional[TensorType["action_dim"]] = None,
+    ) -> Tuple[TensorType["state_dim", "action_dim"], TensorType["action_dim"]]:
         """
         Determines all parents and actions that lead to state.
 
@@ -177,18 +192,17 @@ class Scrabble(GFlowNetEnv):
         state = self._get_state(state)
         done = self._get_done(done)
         if done:
-            return [state], [self.eos]
+            return state, torch.tensor([self.eos], device=self.device)
         if self.equal(state, self.source):
             return [], []
         pos_last_letter = self._get_seq_length(state) - 1
         parent = copy(state)
         parent[pos_last_letter] = self.pad_idx
-        p_action = (state[pos_last_letter],)
-        return [parent], [p_action]
-
+        p_action = state[pos_last_letter]
+        return parent, p_action
     def step(
         self, action: Tuple[int], skip_mask_check: bool = False
-    ) -> [List[int], Tuple[int], bool]:
+    ) -> Tuple[TensorType["state_dim","action_dim"], TensorType["action_dim"], bool]:
         """
         Executes step given an action.
 
@@ -204,10 +218,10 @@ class Scrabble(GFlowNetEnv):
 
         Returns
         -------
-        self.state : list
+        self.state : TensorType["state_dim","action_dim"]
             The sequence after executing the action
 
-        action : tuple
+        action : TensorType["action_dim"]
             Action executed
 
         valid : bool
@@ -237,6 +251,28 @@ class Scrabble(GFlowNetEnv):
         plus one (EOS action).
         """
         return self.max_length + 1
+
+
+
+    def action2index(self, action):
+        """
+        Converts an action into its index in the action space.
+
+        Args
+        ----
+        action : tuple
+            Action to be converted.
+
+        Returns
+        -------
+        Index of the action in the action space.
+        """
+        if action == (self.eos_idx,):
+            return self.action_space_dim - 1
+        return self.token2idx[self.idx2token[action[0]]]
+
+
+
 
     def states2proxy(
         self, states: Union[List[List[int]], List[TensorType["max_length"]]]
@@ -275,6 +311,11 @@ class Scrabble(GFlowNetEnv):
         A tensor containing all the states in the batch.
         """
         states = tlong(states, device=self.device)
+
+        # Replace any negative class values (e.g. EOS = -1) with pad_idx so one_hot
+        # receives non-negative class indices. Also clamp upper bound to n_letters.
+
+
         return (
             F.one_hot(states, self.n_letters + 1)
             .reshape(states.shape[0], -1)
@@ -386,7 +427,7 @@ class Scrabble(GFlowNetEnv):
 
         Args
         ----
-        state : list
+        state : list or tensor
             The input sequence. If None, self.state is used.
 
         Returns
@@ -394,7 +435,10 @@ class Scrabble(GFlowNetEnv):
         Length of the sequence, without counting the padding.
         """
         state = self._get_state(state)
-        if state[-1] == self.pad_idx:
-            return state.index(self.pad_idx)
-        else:
-            return len(state)
+        # ensure tensor on correct device / dtype
+        state_t = tlong(state, device=self.device).flatten()
+        # find first pad index (pad_idx == 0). If none, sequence is full.
+        pad_positions = (state_t == self.pad_idx).nonzero(as_tuple=False)
+        if pad_positions.numel() == 0:
+            return int(state_t.numel())
+        return int(pad_positions[0].item())

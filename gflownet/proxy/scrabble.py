@@ -80,11 +80,12 @@ class ScrabbleScorer(Proxy):
                 is_in_vocabulary = self._is_in_vocabulary(states)
             else:
                 is_in_vocabulary = torch.ones_like(output, dtype=torch.bool)
-            output[is_in_vocabulary] = tfloat(
+            tmp = tfloat(
                 self.scores[states[is_in_vocabulary]].sum(dim=1),
                 float_type=self.float,
                 device=self.device,
             )
+            output[is_in_vocabulary] = tmp.squeeze(-1)
             return output
         elif isinstance(states, list):
             scores = []

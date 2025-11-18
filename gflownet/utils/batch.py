@@ -1863,6 +1863,10 @@ class Batch:
                 self.masks_invalid_actions_forward[batch_idx] = self.envs[
                     traj_idx
                 ].get_mask_invalid_actions_forward(state, done)
+                if not self.masks_invalid_actions_forward[batch_idx].all():
+                    raise ValueError(
+                        "env.masks_invalid_actions_forward() returned only invalid "
+                    )
             return self.masks_invalid_actions_forward[batch_idx]
         elif item == "mask_b" or item == "mask_backward":
             if self.masks_invalid_actions_backward[batch_idx] is None:
@@ -1871,6 +1875,10 @@ class Batch:
                 self.masks_invalid_actions_backward[batch_idx] = self.envs[
                     traj_idx
                 ].get_mask_invalid_actions_backward(state, done)
+                if not self.masks_invalid_actions_backward[batch_idx].all():
+                    raise ValueError(
+                        "env.get_mask_invalid_actions_backward() returned only invalid "
+                    )
             return self.masks_invalid_actions_backward[batch_idx]
         else:
             raise ValueError(

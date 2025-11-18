@@ -358,6 +358,11 @@ class GFlowNetAgent:
         mask_invalid_actions = self._get_masks(
             envs, batch, env_cond, backward, backward
         )
+        if mask_invalid_actions.all():
+            mask_invalid_actions = self._get_masks(
+                    envs, batch, env_cond, backward, backward
+                )
+
 
         # Get policy inputs from the states and obtain the policy outputs from the
         # model

@@ -192,15 +192,31 @@ class GFlowNetEnv:
         """
         Returns the corresponding indices in the action space of the actions in a batch.
         """
-        # Expand the action_space tensor: [batch_size, d_actions_space, action_dim]
-        action_space = torch.unsqueeze(self.action_space, 0).expand(
-            actions.shape[0], -1, -1
-        )
-        # Expand the actions tensor: [batch_size, d_actions_space, action_dim]
-        actions = torch.unsqueeze(actions, 1).expand(-1, self.action_space_dim, -1)
-        # Take the indices at the d_actions_space dimension where all the elements in
-        # the action_dim dimension are True
-        return torch.where(torch.all(actions == action_space, dim=2))[1]
+        # Ensure actions is a tensor on the correct device
+        actions = torch.as_tensor(actions, device=self.device)
+
+        # Normalize dimensions: expect [batch_size, action_dim]
+        if actions.dim() == 1:
+            actions = actions.unsqueeze(0)
+
+        # Ensure action dimensionality matches action_space
+        if actions.shape[1] != self.action_space.shape[1]:
+            raise ValueError(
+                f"Action dimensionality {actions.shape[1]} does not match "
+                f"action_space dimensionality {self.action_space.shape[1]}"
+            )
+
+        # Compare each action in the batch against all entries in action_space.
+        # Resulting shape: [batch_size, action_space_dim]
+        matches = (actions.unsqueeze(1) == self.action_space.unsqueeze(0)).all(dim=2)
+
+        # Ensure every row has at least one match
+        if not torch.all(matches.any(dim=1)):
+            bad_idx = (~matches.any(dim=1)).nonzero(as_tuple=True)[0].tolist()
+            raise ValueError(f"Some actions in the batch were not found in the action_space. Bad indices: {bad_idx}")
+
+        # Return the index of the (first) matching action for each batch row
+        return torch.argmax(matches.long(), dim=1)
 
     def _get_state(self, state: Union[List, TensorType["state_dims"]]):
         """
@@ -219,7 +235,11 @@ class GFlowNetEnv:
             The argument state, or self.state if state is None.
         """
         if state is None:
-            state = copy(self.state)
+            state = self.state.clone()
+
+        if isinstance(state, list):
+            state = torch.tensor(state, device=self.device)
+
         return state
 
     def _get_done(self, done: bool):
@@ -281,12 +301,12 @@ class GFlowNetEnv:
         state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
         parents_a: Optional[List] = None,
-    ) -> List:
+    ) -> TensorType["action_space_dim"]:
         """
         Returns a list of length the action space with values:
             - True if the backward action is invalid from the current state.
             - False otherwise.
-        For continuous or hybrid environments, this mask corresponds to the discrete
+        For continuous environments, this mask corresponds to the discrete
         part of the action space.
 
         The base implementation below should be common to all discrete spaces as it
@@ -298,9 +318,43 @@ class GFlowNetEnv:
         done = self._get_done(done)
         if parents_a is None:
             _, parents_a = self.get_parents(state, done)
-        mask = torch.ones(self.action_space_dim, dtype=torch.bool)
-        for pa in parents_a:
-            mask[self.action_space.index(pa)] = False
+
+        # create default mask (all invalid)
+        mask = torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
+
+        # parents_a may be a single action tuple/tensor or a list/tensor of actions.
+        # Normalize parents_a into a tensor representing a single action.
+        if parents_a is None or (isinstance(parents_a, (list, tuple)) and len(parents_a) == 0):
+            return mask
+
+        # If parents_a is a Python scalar/tuple/list convert to tensor
+        if not torch.is_tensor(parents_a):
+            try:
+                parents_a_t = torch.tensor(parents_a, device=self.device)
+            except Exception:
+                parents_a_t = tlong(parents_a, device=self.device)
+        else:
+            parents_a_t = parents_a.to(self.device)
+
+        # Compare each row of action_space to the parent action(s). For discrete
+        # action spaces action_space is typically 2D ([n_actions, action_dim]).
+        # Build per-row equality and set those indices to False (valid).
+        if self.action_space.dim() == 2:
+            # parents_a_t might be a single action (1D) or a batch (2D). Handle both.
+            if parents_a_t.dim() == 1:
+                eq = (self.action_space == parents_a_t).all(dim=1)
+            else:
+                # if parents_a_t is a batch, mark any action present in parents_a_t as valid
+                eq = torch.zeros(self.action_space.shape[0], dtype=torch.bool, device=self.device)
+                for pa in parents_a_t:
+                    eq = eq | (self.action_space == pa).all(dim=1)
+        else:
+            # action_space is 1D
+            eq = (self.action_space == parents_a_t).reshape(-1).to(torch.bool)
+
+        mask[eq] = False
+        if not mask.any():
+            raise ValueError("No valid backward actions found, there is likely a bug.")
         return mask
 
     def get_mask(
@@ -308,7 +362,7 @@ class GFlowNetEnv:
         state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
         backward: Optional[bool] = False,
-    ) -> List:
+    ) -> TensorType["action_space_dim"]:
         """
         Returns a mask of invalid actions given a state and a done value. Depending on
         backward, either the forward or the backward mask is returned, by calling the
@@ -335,7 +389,7 @@ class GFlowNetEnv:
         """
         if mask is None:
             mask = self.get_mask(state, done, backward)
-        return self.action_space[~torch.tensor(mask, dtype=torch.bool, device=self.device)]
+        return self.action_space[~torch.tensor(mask, dtype=torch.bool, device=self.device)].detach().clone()
 
     def get_parents(
         self,
@@ -380,15 +434,15 @@ class GFlowNetEnv:
 
     # TODO: consider returning only do_step
     def _pre_step(
-        self, action: Tuple[int], backward: bool = False, skip_mask_check: bool = False
-    ) -> Tuple[bool, List[int], Tuple[int]]:
+        self, action: TensorType["action_dim"], backward: bool = False, skip_mask_check: bool = False
+    ) -> Tuple[bool, TensorType["state_dim", "action_dim"], TensorType["action_dim"]]:
         """
         Performs generic checks shared by the step() and step_backward() (backward must
         be True) methods of all environments.
 
         Args
         ----
-        action : tuple
+        action : TensorType["action_dim"]
             Action from the action space.
 
         skip_mask_check : bool
@@ -400,17 +454,28 @@ class GFlowNetEnv:
         do_step : bool
             If True, step() should continue further, False otherwise.
 
-        self.state : list
+        self.state : TensorType["state_dim", "action_dim"]
             The sequence after executing the action
 
-        action : int
+        action : TensorType["action_dim"]
             Action index
         """
         # If action not found in action space raise an error
-        if not self.action_space.isin(action).any():
-            raise ValueError(
-                f"Tried to execute action {action} not present in action space."
-            )
+        # Support actions passed as tensors ([action_dim] or [1, action_dim]) or as tuples/lists.
+        # For tensor actions use actions2indices (will raise if any action not found).
+        # For non-tensor actions fall back to action2index (dictionary lookup / representative).
+        if torch.is_tensor(action):
+            try:
+                # actions2indices accepts a single action or a batch; will raise on missing actions
+                _ = self.actions2indices(action)
+            except Exception as e:
+                raise ValueError(f"Tried to execute action {action} not present in action space.") from e
+        else:
+            try:
+                _ = self.action2index(action)
+            except Exception as e:
+                raise ValueError(f"Tried to execute action {action} not present in action space.") from e
+
         # If backward and state is source, step should not proceed.
         if backward is True:
             if self.equal(self.state, self.source) and action != self.eos:
