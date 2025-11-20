@@ -38,6 +38,9 @@ class VerificationProxy(Proxy) :
             else:
                 label_list.append(int(lbl))
         self.labels = torch.tensor(label_list, device=self.device, dtype=torch.int8)
+        self.all_forces = torch.stack(self.dataset.labeled_forces['data'].tolist(), dim=0)  # (num_recordings, T)
+        # Move the force tensor to the proxy device and cast to working float dtype
+        self.all_forces = self.all_forces.to(device=self.device, dtype=self.float)
 
 
 
@@ -60,103 +63,77 @@ class VerificationProxy(Proxy) :
     #     # num_recordings, n_split, recording_len // n_split
     #     segmented_data = self.dataset.segment_force_curves(n_splits=states.shape[1])
         
-    def apply_functions(self, states: torch.TensorType):
-        # states shape: (num_states, max_functions, 3) e.g., [100, 4, 3]
-        #   That is 100 states of 4 functions each defined by (func_idx, start, end)
-        # segmented_data shape: (num_recordings, max_functions, segment_length) e.g., [215, 4, start to end]
-        # output shape: (num_states, max_functions, num_recordings) e.g., [100, 4, 215]
-        function_results = torch.zeros(states.shape[0], states.shape[1], len(self.dataset),  device=self.device, dtype=self.float)
-        
-        
-        #slice the dataset into segments based on start and end indices in states
-        segmented_data = self.dataset.labeled_forces[:, states[:,:,1], states[:,:,2]]  # Shape: (num_recordings, max_functions, segment_length)
+    def apply_functions(self, states: torch.Tensor):
+        """
+        Apply functions to inclusive [start, end] slices for all recordings.
+        - states: (num_states, max_functions, 3) with (func_idx, start, end), end exclusive
+        - self.dataset.labeled_forces: (num_recordings, T)
+        - Each function in self.func_dict accepts variable-length slices (num_recordings, seg_len)
+        Returns:
+            function_results: (num_states, max_functions, num_recordings)
+        """
+        # Shapes
+        num_states, max_functions, _ = states.shape
 
-
-        # Apply functions to each segment based on states by vectorization
-        for func_idx in range(1, len(self.func_dict) + 1):
-            mask = states[:,:,0] == func_idx  # Shape: (num_states, max_functions)
-            if mask.any():
-                cur_func = self.func_dict[func_idx]
-                # Select segments corresponding to the current function
-                cur_data = segmented_data[:, mask]  # Shape: (num_recordings, num_selected_segments, segment_length)
-
-                # cur_data: (num_recordings, num_selected_segments, seg_len)
-                # For each selected segment j we want a vector of length num_recordings
-                # with the function applied per recording. Compute per-segment results
-                # and stack so res has shape (num_selected_segments, num_recordings[, out_dim]).
-                num_recordings, num_selected_segments, _ = cur_data.shape
-                res_list = []
-                for j in range(num_selected_segments):
-                    seg = cur_data[:, j, :]  # (num_recordings, seg_len)
-                    per_rec = torch.vmap(cur_func)(seg)  # (num_recordings,) or (num_recordings, k)
-                    res_list.append(per_rec)
-                res = torch.stack(res_list, dim=0)  # (num_selected_segments, num_recordings, ...)
-
-                # If functions return an extra singleton dim, squeeze it
-                if res.dim() == 3 and res.shape[2] == 1:
-                    res = res.squeeze(2)  # -> (num_selected_segments, num_recordings)
-
-                res = res.to(dtype=self.float)
-
-                # Assign results back to function_results.
-                # idxs order matches the flattened boolean mask used by SegmentedData.__getitem__,
-                # so enumerate(idx) corresponds to rows of `res`.
-                idxs = torch.nonzero(mask, as_tuple=False)  # Get indices where mask is True
-                for i, (state_idx, func_pos) in enumerate(idxs):
-                    function_results[state_idx, func_pos, :] = res[i, :]
-
+        # Build a single tensor of all recorded force traces from the dataset DataFrame.
+        # ForceDataset stores tensors under the 'data' column, so stack them into a tensor:
+        if len(self.dataset.labeled_forces) == 0:
+            raise ValueError("Dataset is empty")
 
         
-        # for func_idx in range(1, len(self.func_dict)) :
-        #     mask = states[:,0] == func_idx
-        #     cur_func = torch.vmap(self.func_dict[func_idx])
-            
 
-        #     for idx in range(mask.shape[0]) :
-                
-        #         state_mask = mask[idx,:]
-        #         if state_mask.any():
-                    
-        #             cur_data = segmented_data[:,state_mask]
-        #             res = cur_func(cur_data)
-        #             # Handle different result shapes and data types
-        #             if res.dim() == 1:
-        #                 # Functions like min, max, argmin, argmax return 1D tensors
-        #                 res = res.unsqueeze(-1)  # Shape: [215] -> [215, 1]
-        #             elif res.dim() == 2 and res.shape[1] > 1:
-        #                 # This shouldn't happen with your current setup, but just in case
-        #                 pass
-        #             # For trapezoid, res.dim() == 2 and res.shape[1] == 1, so no change needed
-                    
-        #             # Convert to the correct dtype
-        #             res = res.to(dtype=self.float)
-        #             # print(f"function: {self.func_dict[func_idx].__name__}",
-        #             #     f"mask: {state_mask}",
-        #             #     f"data shape: {cur_data.shape}",
-        #             #       f"res shape: {res.shape}")
-        #             function_results[idx, :, state_mask] = res
-        #             #print(function_results)
+        num_recordings, T = self.all_forces.shape
 
-        
-        return function_results
-    
+        # Move states to device and ensure integer indices
+        states = states.to(device=self.device)
+        func_ids = states[:, :, 0].to(dtype=torch.long)
+        starts   = states[:, :, 1].to(dtype=torch.long)
+        ends     = states[:, :, 2].to(dtype=torch.long)
 
+        # Output: (num_states, max_functions, num_recordings)
+        function_results = torch.zeros(
+            num_states, max_functions, num_recordings,
+            device=self.device, dtype=self.float
+        )
 
+        # Prefer iterating unique function ids in states to match whatever keys exist in func_dict
+        unique_fids = torch.unique(func_ids)
+        for f_id in unique_fids.tolist():
+            if f_id not in self.func_dict:
+                continue
 
+            mask = (func_ids == f_id)  # (num_states, max_functions)
+            if not mask.any():
+                continue
 
-        # # Apply each function to corresponding segments based on states
-        # for segment_idx, data_segment in enumerate(segmented_data):
-        #     for func_idx in range(1, len(self.func_dict)):
-        #         # Find positions where this function should be applied
-        #         mask = states == func_idx
-        #         if mask.any():  # Only process if there are positions for this function
-        #             # Apply the function to the corresponding data segment
-        #             result = self.func_dict[func_idx](data_segment[func_idx])
-        #             # Update function_results at masked positions
-        #             # Assuming result needs to go into the segment_idx column of function_results
-        #             function_results[:,:, segment_idx][mask] = result
+            cur_func = self.func_dict[f_id]
+            idxs = torch.nonzero(mask, as_tuple=False)  # [(state_idx, func_pos), ...]
+
+            # Try torch.vmap; fall back to torch.func.vmap for older PyTorch
+            try:
+                vmap = torch.vmap
+            except AttributeError:
+                from torch.func import vmap
+
+            for state_idx, func_pos in idxs:
+                start = int(starts[state_idx, func_pos].item())
+                end   = int(ends[state_idx, func_pos].item())  # exclusive
+
+                # Exclusive slicing: use end 
+                seg = self.all_forces[:, start:end]  # (num_recordings, seg_len)
+
+                # Apply function across recordings
+                per_rec = vmap(cur_func)(seg)  # -> (num_recordings,) or (num_recordings, k)
+
+                # Squeeze trailing singleton if present
+                if per_rec.dim() > 1 and per_rec.shape[-1] == 1:
+                    per_rec = per_rec.squeeze(-1)
+
+                # Store results
+                function_results[state_idx, func_pos, :] = per_rec.to(dtype=self.float)
 
         return function_results
+ 
 
 
 def reward_function(grouped_data,

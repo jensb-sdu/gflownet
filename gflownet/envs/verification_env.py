@@ -3,7 +3,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
-
+from torchtyping import TensorType
 
 from gflownet.envs.base import GFlowNetEnv
 from gflownet.utils.common import copy, tlong
@@ -33,8 +33,8 @@ class VerificationEnv(GFlowNetEnv) :
     def __init__(self,
                  functions: Iterable = None,
                  data_path: Union[str, Path] = None,
-                 max_length: int = 8,
-                 window_size: int = 1024,
+                 max_length: int = 16,
+                 window_size: int = 2048,
                  min_function_width = 64,
                  **kwargs):
         
@@ -56,6 +56,8 @@ class VerificationEnv(GFlowNetEnv) :
         self.max_length = max_length
         self.eos_idx = -1
         self.pad_idx = 0
+        self.eos = [self.eos_idx, 0, 0]
+        self.padding = [self.pad_idx, 0, 0]
         self.source = torch.tensor([[self.pad_idx,0 ,0]  * self.max_length])
         self.funcidx2token = { idx + 1 : func for idx, func in enumerate(self.functions) }
         
@@ -86,7 +88,7 @@ class VerificationEnv(GFlowNetEnv) :
         self,
         state: Optional[List[int]] = None,
         done: Optional[bool] = None,
-    ) -> List[bool]:
+    ) -> TensorType["action_space_dim"]:
         """
         Returns a list of length the action space with values:
             - True if the forward action is invalid from the current state.
@@ -107,13 +109,13 @@ class VerificationEnv(GFlowNetEnv) :
         state = self._get_state(state)
         done = self._get_done(done)
         if done:
-            return [True for _ in range(self.action_space_dim)]
+            return torch.ones(self.action_space_dim, dtype=torch.bool, device=self)
         # If sequence is not at maximum length, all actions are valid
-        if state[-1] == self.pad_idx:
-            return [False for _ in range(self.action_space_dim)]
+        if state[-1] == self.padding:
+            return torch.zeros(self.action_space_dim, dtype=torch.bool, device=self)
         # Otherwise, only EOS is valid
-        mask = [True for _ in range(self.action_space_dim)]
-        mask[self.action_space.index(self.eos)] = False
+        mask = torch.ones(self.action_space_dim, dtype=torch.bool, device=self)
+        mask[self.eos_idx] = False
         return mask
     
 
@@ -156,10 +158,10 @@ class VerificationEnv(GFlowNetEnv) :
             return [state], [self.eos]
         if self.equal(state, self.source):
             return [], []
-        pos_last_letter = self._get_seq_length(state) - 1
+        last_func_idx = self._get_seq_length(state) - 1
         parent = copy(state)
-        parent[pos_last_letter] = self.pad_idx
-        p_action = (state[pos_last_letter],)
+        parent[last_func_idx] = self.pad_idx
+        p_action = (state[last_func_idx],)
         return [parent], [p_action]
     
 

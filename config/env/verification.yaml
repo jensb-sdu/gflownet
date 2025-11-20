@@ -1,0 +1,12 @@
+defaults:
+  - base
+
+_target_: gflownet.envs.verification_env.VerificationEnv
+
+id: scrabble
+
+
+data_path: "/home/dmd_user/Desktop/ECAA/gfn_verification/csv_data/csv_real_robot_sdu/csv_real_robot_admittance"
+window_size: 256
+max_length: 8
+min_function_width: 16
