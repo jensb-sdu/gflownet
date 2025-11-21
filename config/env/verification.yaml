@@ -7,6 +7,6 @@ id: verification
 
 
 data_path: "/home/dmd_user/Desktop/ECAA/gfn_verification/csv_data/csv_real_robot_sdu/csv_real_robot_admittance"
-window_size: 2048
+window_size: 1024
 max_length: 8
 min_function_width: 32

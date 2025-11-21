@@ -174,7 +174,11 @@ class VerificationEnv(GFlowNetEnv) :
         # If sequence is not at maximum length, all actions are valid
         seq_len = self._get_seq_length(state)
         if seq_len < self.max_length:
-            return torch.zeros(self.action_space_dim, dtype=torch.bool, device=self.device)
+            mask = torch.zeros(self.action_space_dim, dtype=torch.bool, device=self.device)
+            #filter out existing actions in the current state
+            mask[self.actions2indices(state[:seq_len])] = True          
+            return mask
+
         # Otherwise, only EOS is valid
         mask = torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
         mask[self.eos_idx] = False
@@ -273,146 +277,146 @@ class VerificationEnv(GFlowNetEnv) :
             return self.state, action, valid
     
     
-    def randomize_and_temper_sampling_distribution(
-        self,
-        policy_outputs: TensorType["n_states", "policy_output_dim"],
-        probability_random_action: Optional[float] = 0.0,
-        temperature: Optional[float] = 1.0,
-    ) -> TensorType["n_states", "policy_output_dim"]:
-        """
-        Replaces the rows of `policy_outputs` by a vector corresponding to a random
-        sampling policy with the probability indicated by `probability_random_action`.
+    # def randomize_and_temper_sampling_distribution(
+    #     self,
+    #     policy_outputs: TensorType["n_states", "policy_output_dim"],
+    #     probability_random_action: Optional[float] = 0.0,
+    #     temperature: Optional[float] = 1.0,
+    # ) -> TensorType["n_states", "policy_output_dim"]:
+    #     """
+    #     Replaces the rows of `policy_outputs` by a vector corresponding to a random
+    #     sampling policy with the probability indicated by `probability_random_action`.
 
-        Note that the tensor of policy outputs is not cloned if neither tempering nor
-        random actions are incorporated. This implies that the original tensor of
-        policy outputs may be modified by subsequent methods (namely
-        sample_actions_batch()), for example to mask the invalid actions.
+    #     Note that the tensor of policy outputs is not cloned if neither tempering nor
+    #     random actions are incorporated. This implies that the original tensor of
+    #     policy outputs may be modified by subsequent methods (namely
+    #     sample_actions_batch()), for example to mask the invalid actions.
 
-        Parameters
-        ----------
-        policy_outputs : tensor
-            The original outputs of the sampling policy. For example, they may
-            correspond to the output (logits) of the GFlowNet policy model.
-        probability_random_action : float, optional
-            The probability of sampling a random action. If larger than one, the logits
-            will be replaced by a random policy vector with this probability, according
-            to Bernoulli distribution. By default, the probability is 0.0 (no random
-            actions).
-        temperature : float, optional
-            A scalar by which the logits are divided to adjust the sampling
-            distribution. A temperature larger than one will result in a flatter
-            distribution, favouring exploration. A temperature smaller than one will
-            sharpen the distribution, favouring concentration around high probability
-            actions. By default, the temperature is 1.0 (no tempering).
+    #     Parameters
+    #     ----------
+    #     policy_outputs : tensor
+    #         The original outputs of the sampling policy. For example, they may
+    #         correspond to the output (logits) of the GFlowNet policy model.
+    #     probability_random_action : float, optional
+    #         The probability of sampling a random action. If larger than one, the logits
+    #         will be replaced by a random policy vector with this probability, according
+    #         to Bernoulli distribution. By default, the probability is 0.0 (no random
+    #         actions).
+    #     temperature : float, optional
+    #         A scalar by which the logits are divided to adjust the sampling
+    #         distribution. A temperature larger than one will result in a flatter
+    #         distribution, favouring exploration. A temperature smaller than one will
+    #         sharpen the distribution, favouring concentration around high probability
+    #         actions. By default, the temperature is 1.0 (no tempering).
 
-        Returns
-        -------
-        policy_outputs : tensor
-            The modified policy outputs.
-        """
-        if not math.isclose(temperature, 1.0, abs_tol=1e-08):
-            do_temper = True
-        else:
-            do_temper = False
-        if not math.isclose(probability_random_action, 0.0, abs_tol=1e-08):
-            do_random = True
-        else:
-            do_random = False
-        if not do_temper and not do_random:
-            return policy_outputs
+    #     Returns
+    #     -------
+    #     policy_outputs : tensor
+    #         The modified policy outputs.
+    #     """
+    #     if not math.isclose(temperature, 1.0, abs_tol=1e-08):
+    #         do_temper = True
+    #     else:
+    #         do_temper = False
+    #     if not math.isclose(probability_random_action, 0.0, abs_tol=1e-08):
+    #         do_random = True
+    #     else:
+    #         do_random = False
+    #     if not do_temper and not do_random:
+    #         return policy_outputs
 
-        # Clone the sampling logits in order not to change the original tensor
-        logits_sampling = policy_outputs.clone().detach().to('cpu')
-        if do_temper:
-            logits_sampling /= temperature
-        if do_random:
-            idx_random = tbool(
-                Bernoulli(
-                    probability_random_action * torch.ones(policy_outputs.shape[0])
-                ).sample(),
-                device='cpu',
-            )
-            logits_sampling[idx_random, :] = self.random_policy_output
-        return policy_outputs
+    #     # Clone the sampling logits in order not to change the original tensor
+    #     logits_sampling = policy_outputs.clone().detach().to('cpu')
+    #     if do_temper:
+    #         logits_sampling /= temperature
+    #     if do_random:
+    #         idx_random = tbool(
+    #             Bernoulli(
+    #                 probability_random_action * torch.ones(policy_outputs.shape[0])
+    #             ).sample(),
+    #             device='cpu',
+    #         )
+    #         logits_sampling[idx_random, :] = self.random_policy_output
+    #     return policy_outputs
 
     
-    def sample_actions_batch(
-        self,
-        policy_outputs: TensorType["n_states", "policy_output_dim"],
-        mask: Optional[TensorType["n_states", "policy_output_dim"]] = None,
-        states_from: Optional[List] = None,
-        is_backward: Optional[bool] = False,
-        random_action_prob: Optional[float] = 0.0,
-        temperature_logits: Optional[float] = 1.0,
-    ) -> Tuple[List[Tuple], TensorType["n_states"]]:
-        """
-        Samples a batch of actions from a batch of policy outputs.
+    # def sample_actions_batch(
+    #     self,
+    #     policy_outputs: TensorType["n_states", "policy_output_dim"],
+    #     mask: Optional[TensorType["n_states", "policy_output_dim"]] = None,
+    #     states_from: Optional[List] = None,
+    #     is_backward: Optional[bool] = False,
+    #     random_action_prob: Optional[float] = 0.0,
+    #     temperature_logits: Optional[float] = 1.0,
+    # ) -> Tuple[List[Tuple], TensorType["n_states"]]:
+    #     """
+    #     Samples a batch of actions from a batch of policy outputs.
 
-        This implementation is generally valid for all discrete environments but
-        continuous or mixed environments need to reimplement this method.
+    #     This implementation is generally valid for all discrete environments but
+    #     continuous or mixed environments need to reimplement this method.
 
-        The method is valid for both forward and backward actions in the case of
-        discrete environments. Some continuous environments may also be agnostic to the
-        difference between forward and backward actions since the necessary information
-        can be contained in the mask. However, some continuous environments do need to
-        know whether the actions are forward of backward, which is why this can be
-        specified by the argument is_backward.
+    #     The method is valid for both forward and backward actions in the case of
+    #     discrete environments. Some continuous environments may also be agnostic to the
+    #     difference between forward and backward actions since the necessary information
+    #     can be contained in the mask. However, some continuous environments do need to
+    #     know whether the actions are forward of backward, which is why this can be
+    #     specified by the argument is_backward.
 
-        Most environments do not need to know the states from which the actions are to
-        be sampled since the necessary information is in both the policy outputs and
-        the mask. However, some continuous environments do need to know the originating
-        states in order to construct the actions, which is why one of the arguments is
-        states_from.
+    #     Most environments do not need to know the states from which the actions are to
+    #     be sampled since the necessary information is in both the policy outputs and
+    #     the mask. However, some continuous environments do need to know the originating
+    #     states in order to construct the actions, which is why one of the arguments is
+    #     states_from.
 
-        Note that methods overriding this method should randomize and temper the
-        logits.
+    #     Note that methods overriding this method should randomize and temper the
+    #     logits.
 
-        Parameters
-        ----------
-        policy_outputs : tensor
-            The output of the GFlowNet policy model.
-        mask : tensor
-            The mask of invalid actions. For continuous or mixed environments, the mask
-            may be tensor with an arbitrary length contaning information about special
-            states, as defined elsewhere in the environment.
-        states_from : tensor
-            The states originating the actions, in GFlowNet format. Ignored in discrete
-            environments and only required in certain continuous environments.
-        is_backward : bool
-            True if the actions are backward, False if the actions are forward
-            (default). Ignored in discrete environments and only required in certain
-            continuous environments.
-        random_action_prob : float, optional
-            The probability of sampling a random action. If larger than one, the model
-            outputs will be replaced by a random policy vector with probability
-            `random_action_prob`, according to Bernoulli distribution.
-        temperature_logits : float, optional
-            A scalar by which the model outputs are divided to temper the sampling
-            distribution.
+    #     Parameters
+    #     ----------
+    #     policy_outputs : tensor
+    #         The output of the GFlowNet policy model.
+    #     mask : tensor
+    #         The mask of invalid actions. For continuous or mixed environments, the mask
+    #         may be tensor with an arbitrary length contaning information about special
+    #         states, as defined elsewhere in the environment.
+    #     states_from : tensor
+    #         The states originating the actions, in GFlowNet format. Ignored in discrete
+    #         environments and only required in certain continuous environments.
+    #     is_backward : bool
+    #         True if the actions are backward, False if the actions are forward
+    #         (default). Ignored in discrete environments and only required in certain
+    #         continuous environments.
+    #     random_action_prob : float, optional
+    #         The probability of sampling a random action. If larger than one, the model
+    #         outputs will be replaced by a random policy vector with probability
+    #         `random_action_prob`, according to Bernoulli distribution.
+    #     temperature_logits : float, optional
+    #         A scalar by which the model outputs are divided to temper the sampling
+    #         distribution.
 
-        Returns
-        -------
-        actions : list
-            The list of sampled actions.
-        """
-        # Randomize actions and temper the logits
-        logits_sampling = self.randomize_and_temper_sampling_distribution(
-            policy_outputs, random_action_prob, temperature_logits
-        )
+    #     Returns
+    #     -------
+    #     actions : list
+    #         The list of sampled actions.
+    #     """
+    #     # Randomize actions and temper the logits
+    #     logits_sampling = self.randomize_and_temper_sampling_distribution(
+    #         policy_outputs, random_action_prob, temperature_logits
+    #     )
 
-        # Make the logits of invalid actions equal to -inf.
-        if mask is not None:
-            if torch.all(mask, dim=1).any():
-                raise RuntimeError(
-                    "All actions in the mask are invalid for some states in the batch."
-                )
-            logits_sampling[mask] = -torch.inf
+    #     # Make the logits of invalid actions equal to -inf.
+    #     if mask is not None:
+    #         if torch.all(mask, dim=1).any():
+    #             raise RuntimeError(
+    #                 "All actions in the mask are invalid for some states in the batch."
+    #             )
+    #         logits_sampling[mask] = -torch.inf
 
-        # Sample actions from the Categorical distributions defined by the logits
-        action_indices = Categorical(logits=logits_sampling).sample().to(self.device)
-        # Build actions
-        actions = self.action_space[action_indices]
-        return actions
+    #     # Sample actions from the Categorical distributions defined by the logits
+    #     action_indices = Categorical(logits=logits_sampling).sample().to(self.device)
+    #     # Build actions
+    #     actions = self.action_space[action_indices]
+    #     return actions
     
 
     def state2readable(self, state: TensorType["state_dim", "action_dim"] = None) -> str:
