@@ -10,7 +10,7 @@ from pathlib import Path
 from matplotlib import pyplot as plt
 from itertools import combinations
 from torch.distributions import Categorical
-
+from gflownet.envs.verification_env import FUNCTIONS
 #import umap
 
 class ForceDataset(Dataset):
@@ -342,6 +342,173 @@ def plot_all_dimension_combinations(points, masks, labels=None, point_colors=Non
     return fig, axes
  
 
+def read_gfn_samples(sample_path):
+    df = pd.read_csv(sample_path)
+    if 'readable' not in df.columns or 'energies' not in df.columns:
+        raise ValueError("CSV must contain 'readable' and 'energies' columns")
+
+    readable_list = df['readable'].astype(str).tolist()
+    energies = df['energies'].astype(float).to_numpy()
+    return readable_list, energies
 
 
 
+def plot_gfn_samples_umap(sample_path, n_points=1000):
+    """
+    Plot GFlowNet samples in 2D UMAP space colored by energy.
+
+    Args:
+        sample_path: path to CSV containing columns 'readable' and 'energies'
+        n_points: number of points to sample for plotting
+    """
+    try:
+        import umap
+    except Exception:
+        raise ImportError("umap-learn is required for plot_gfn_samples")
+
+    # Read CSV and extract columns
+    readable_list, energies = read_gfn_samples(sample_path)
+    # Simple tokenization + count-vectorizer (vocabulary from tokens in readable strings)
+    token_lists = [s.split() for s in readable_list]
+    vocab = {}
+    for tokens in token_lists:
+        for t in tokens:
+            if t not in vocab:
+                vocab[t] = len(vocab)
+    # Build count vectors
+    vectors = np.zeros((len(token_lists), len(vocab)), dtype=float)
+    for i, tokens in enumerate(token_lists):
+        for t in tokens:
+            vectors[i, vocab[t]] += 1.0
+
+    # Compute UMAP embeddings
+    reducer = umap.UMAP(n_components=2, random_state=42)
+    embeddings = reducer.fit_transform(vectors)
+
+    # Sample a subset for plotting if necessary
+    indices = np.arange(len(embeddings))
+    if len(embeddings) > n_points:
+        indices = np.random.choice(len(embeddings), n_points, replace=False)
+    emb_plot = embeddings[indices]
+    energies_plot = energies[indices]
+
+    # Create scatter plot
+    plt.figure(figsize=(10, 8))
+    scatter = plt.scatter(emb_plot[:, 0], emb_plot[:, 1], c=energies_plot, cmap='viridis', alpha=0.7)
+    plt.colorbar(scatter, label='Energy')
+    plt.title('GFlowNet Samples in UMAP Space Colored by Energy')
+    plt.xlabel('UMAP Dimension 1')
+    plt.ylabel('UMAP Dimension 2')
+    plt.grid(True, alpha=0.3)
+    plt.savefig("gfn_samples_umap.png")
+    plt.close()
+
+
+
+
+def plot_gfn_functions_3D(sample_path, n_points=1000):
+    """
+    Plot GFlowNet sampled functions in 3D space. Each token is shown as a point
+    colored by its energy. Uses function indices from FUNCTIONS (verification_env).
+    """
+    import re
+
+    readable_list, energies = read_gfn_samples(sample_path)
+
+    # Parse readable strings into list of (name, start, end)
+    parsed_funcs = []
+    func_names = set()
+    for s in readable_list:
+        matches = re.findall(r'([A-Za-z0-9_+-]+)\[(\d+),\s*(\d+)\]', s)
+        token_list = []
+        for name, a, b in matches:
+            a = int(a)
+            b = int(b)
+            token_list.append((name, a, b))
+            func_names.add(name)
+        parsed_funcs.append(token_list)
+
+    if len(parsed_funcs) == 0:
+        raise ValueError("No parsable function tokens found in 'readable' column.")
+
+    # Map function name -> env index using FUNCTIONS (1-based)
+    func_to_idx = {}
+    for i, f in enumerate(FUNCTIONS, start=1):
+        if callable(f) and hasattr(f, "__name__"):
+            fname = f.__name__
+        else:
+            fname = str(f)
+        func_to_idx[fname] = i
+
+    # Fallback for unseen names
+    next_idx = max(func_to_idx.values()) + 1 if func_to_idx else 1
+    for name in sorted(func_names):
+        if name not in func_to_idx:
+            func_to_idx[name] = next_idx
+            next_idx += 1
+
+    # Subsample indices if needed
+    indices = np.arange(len(parsed_funcs))
+    if len(indices) > n_points:
+        indices = np.random.choice(indices, n_points, replace=False)
+
+    energies_arr = np.array(energies)
+    vmin = np.nanmin(energies_arr)
+    vmax = np.nanmax(energies_arr)
+    cmap = plt.get_cmap('viridis')
+    norm = plt.Normalize(vmin=vmin, vmax=vmax)
+
+    # 3D scatter plotting (no connecting lines)
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+
+    for idx in indices:
+        func = parsed_funcs[int(idx)]
+        if not func:
+            continue
+        # base x indices from env mapping
+        xs_base = [func_to_idx.get(name, -1) for name, _, _ in func]
+        # filter invalid mappings
+        valid = [(x, s, e) for x, (name, s, e) in zip(xs_base, func) if x >= 0]
+        if not valid:
+            continue
+        xs = [v[0] for v in valid]
+        ys = [v[1] for v in valid]
+        zs = [v[2] for v in valid]
+
+        # add small deterministic jitter to x to separate stacked tokens visually
+        n_tokens = len(xs)
+        if n_tokens > 1:
+            jitter = np.linspace(-0.2, 0.2, n_tokens)
+        else:
+            jitter = [0.0]
+        xs_jitter = np.array(xs, dtype=float) + jitter
+
+        energy = float(energies_arr[int(idx)])
+        color = cmap(norm(energy))
+        ax.scatter(xs_jitter, ys, zs, c=[color], s=30, depthshade=True)
+
+    ax.set_xlabel('Function (env index, 1-based)')
+    ax.set_ylabel('Start Position')
+    ax.set_zlabel('End Position')
+    ax.set_title('GFlowNet Sampled Functions in 3D Space (points colored by energy)')
+
+    # colorbar
+    mappable = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    mappable.set_array(energies_arr)
+    cbar = fig.colorbar(mappable, ax=ax, pad=0.1)
+    cbar.set_label('Energy')
+
+    plt.savefig("gfn_functions_3D.png")
+    plt.close()  
+
+
+
+
+
+if __name__ == "__main__":
+    sample_path = "/home/dmd_user/Desktop/ECAA/gfn_verification/gflownet/samples/gfn_samples._8_funcs_nan_zero_no_duplicates.csv"
+    print("Plotting GFlowNet samples...")
+    plot_gfn_samples_umap(sample_path, n_points=1000)
+    plot_gfn_functions_3D(sample_path, n_points=1000)
+    print("Plots saved.")
