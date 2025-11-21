@@ -38,7 +38,9 @@ class GFlowNetEnv:
     """
     Base class of GFlowNet environments
     """
-
+    # shared cache for action -> index mappings across instances
+    _action2index_cache = {}
+ 
     def __init__(
         self,
         device: str = "cpu",
@@ -66,8 +68,11 @@ class GFlowNetEnv:
         # Log SoftMax function
         self.logsoftmax = torch.nn.LogSoftmax(dim=1)
         # Action space
-        self.action_space = self.get_action_space()
-        self._action2index = {a: idx for idx, a in enumerate(self.action_space)}
+        if self.action_space is None:
+            self.action_space = self.get_action_space()
+        # Build or fetch a cached mapping from action -> index.
+        if not hasattr(self, "_action2index") or GFlowNetEnv._action2index is None:
+            GFlowNetEnv._action2index = self.get_action2index(self.action_space)
 
         # Mask dimensionality
         self._mask_dim = self._compute_mask_dim()
@@ -155,7 +160,7 @@ class GFlowNetEnv:
         """
         return self._max_traj_length
 
-    def action2representative(self, action: Tuple) -> int:
+    def action2representative(self, action: TensorType["action_dim"]) -> int:
         """
         For continuous or hybrid environments, converts a continuous action into its
         representative in the action space. Discrete actions remain identical, thus
@@ -165,7 +170,46 @@ class GFlowNetEnv:
         """
         return action
 
-    def action2index(self, action: Tuple) -> int:
+    def get_action2index(self, action_space) -> dict:
+        """
+        Returns a mapping action -> index for the provided action_space.
+        The mapping is cached at class level to avoid rebuilding it for
+        identical action spaces across instances.
+        """
+        # Create a key from the action_space contents (works for torch tensors
+        # and Python lists). For tensors use CPU bytes + shape + dtype to make
+        # the key content-dependent.
+        if torch.is_tensor(action_space):
+            arr = action_space.detach().cpu().numpy()
+            # ensure contiguous for consistent bytes
+            arr = np.ascontiguousarray(arr)
+            key = (arr.shape, str(action_space.dtype), arr.tobytes())
+        else:
+            # fallback: stable string representation
+            key = ("pyobj", repr(action_space))
+
+        if key in GFlowNetEnv._action2index_cache:
+            # return a copy to avoid accidental external mutation
+            return dict(GFlowNetEnv._action2index_cache[key])
+
+        def _to_key(a):
+            if torch.is_tensor(a):
+                a_cpu = a.detach().cpu()
+                if a_cpu.dim() == 0:
+                    return a_cpu.item()
+                return tuple(a_cpu.tolist())
+            if isinstance(a, (list, tuple)):
+                return tuple(a)
+            return a
+
+        mapping = {}
+        for idx, a in enumerate(action_space):
+            mapping[_to_key(a)] = idx
+
+        GFlowNetEnv._action2index_cache[key] = mapping
+        return dict(mapping)
+
+    def action2index(self, action: TensorType["action_dim"]) -> int:
         """
         Returns the index in the action space of the action passed as an argument, or
         its representative if it is a continuous action.
@@ -184,41 +228,93 @@ class GFlowNetEnv:
         int
             The index of the action in the action space.
         """
-        return self._action2index[self.action2representative(action)]
+        key = self.action2representative(action)
+        # Normalize key to same hashable type used when building the dict
+        if torch.is_tensor(key):
+            key_cpu = key.detach().cpu()
+            if key_cpu.dim() == 0:
+                key = key_cpu.item()
+            else:
+                key = tuple(key_cpu.tolist())
+        elif isinstance(key, (list, tuple)):
+            key = tuple(key)
+        return self._action2index[key]
 
     def actions2indices(
         self, actions: TensorType["batch_size", "action_dim"]
     ) -> TensorType["batch_size"]:
         """
         Returns the corresponding indices in the action space of the actions in a batch.
+
+        This implementation uses the cached mapping self._action2index to avoid
+        allocating a large equality tensor (which can cause OOM for very large
+        action spaces). It supports tensor or list inputs.
         """
-        # Ensure actions is a tensor on the correct device
-        actions = torch.as_tensor(actions, device=self.device)
+        # If actions is a tensor convert to cpu numpy for lightweight iteration,
+        # avoid creating massive temporary tensors
+        # Normalize single-row tensors
+        if torch.is_tensor(actions):
+            if actions.dim() == 1:
+                actions_t = actions.unsqueeze(0)
+            else:
+                actions_t = actions
+            # move to cpu for Python-level lookup
+            actions_np = actions_t.detach().cpu().numpy()
+            actions_list = [tuple(r.tolist()) if r.ndim == 1 else tuple([int(x) for x in r]) for r in actions_np]
+        else:
+            # assume iterable of actions (lists/tuples)
+            actions_list = [tuple(a) if not torch.is_tensor(a) else tuple(a.detach().cpu().tolist()) for a in actions]
 
-        # Normalize dimensions: expect [batch_size, action_dim]
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(0)
+        # Use cached mapping
+        mapping = getattr(self, "_action2index", None)
+        if mapping is None:
+            # ensure mapping exists
+            mapping = self.get_action2index(self.action_space)
+            self._action2index = mapping
 
-        # Ensure action dimensionality matches action_space
-        if actions.shape[1] != self.action_space.shape[1]:
-            raise ValueError(
-                f"Action dimensionality {actions.shape[1]} does not match "
-                f"action_space dimensionality {self.action_space.shape[1]}"
-            )
+        indices = []
+        missing = []
+        for i, a in enumerate(actions_list):
+            # apply representative conversion for continuous/hybrid actions
+            try:
+                # action2representative expects action in original type; pass tensor for that case
+                if torch.is_tensor(a):
+                    key = self.action2representative(a)
+                else:
+                    # convert tuple back to tensor temporarily if representative expects tensor
+                    key = self.action2representative(torch.tensor(list(a)))
+                    if torch.is_tensor(key):
+                        # normalize to tuple/list for dict lookup
+                        k_cpu = key.detach().cpu()
+                        if k_cpu.dim() == 0:
+                            key = k_cpu.item()
+                        else:
+                            key = tuple(k_cpu.tolist())
+            except Exception:
+                key = a
 
-        # Compare each action in the batch against all entries in action_space.
-        # Resulting shape: [batch_size, action_space_dim]
-        matches = (actions.unsqueeze(1) == self.action_space.unsqueeze(0)).all(dim=2)
+            # Normalize key to tuple/scalar consistent with get_action2index
+            if torch.is_tensor(key):
+                k_cpu = key.detach().cpu()
+                if k_cpu.dim() == 0:
+                    key = k_cpu.item()
+                else:
+                    key = tuple(k_cpu.tolist())
+            elif isinstance(key, (list, tuple)):
+                key = tuple(key)
 
-        # Ensure every row has at least one match
-        if not torch.all(matches.any(dim=1)):
-            bad_idx = (~matches.any(dim=1)).nonzero(as_tuple=True)[0].tolist()
+            if key in mapping:
+                indices.append(mapping[key])
+            else:
+                missing.append((i, a))
+
+        if missing:
+            bad_idx = [m[0] for m in missing]
             raise ValueError(f"Some actions in the batch were not found in the action_space. Bad indices: {bad_idx}")
 
-        # Return the index of the (first) matching action for each batch row
-        return torch.argmax(matches.long(), dim=1)
+        return torch.tensor(indices, dtype=torch.long, device=self.device)
 
-    def _get_state(self, state: Union[List, TensorType["state_dims"]]):
+    def _get_state(self, state: Union[List, TensorType["state_dims", "action_dim"]]= None) -> TensorType["state_dims", "action_dim"]:
         """
         A helper method for other methods to determine whether state should be taken
         from the arguments or from the instance (self.state): if is None, it is taken
@@ -395,7 +491,7 @@ class GFlowNetEnv:
         self,
         state: Optional[Union[List, TensorType["state_dims"]]] = None,
         done: Optional[bool] = None,
-        action: Optional[Tuple] = None,
+        action: Optional[TensorType["action_dim"]] = None,
     ) -> Tuple[Union[List, TensorType["state_dims"]], Union[List, TensorType["state_dims"]]]:
         """
         Determines all parents and actions that lead to state.
@@ -492,8 +588,8 @@ class GFlowNetEnv:
 
     @abstractmethod
     def step(
-        self, action: Tuple[int], skip_mask_check: bool = False
-    ) -> Tuple[List[int], Tuple[int], bool]:
+        self, action: TensorType["action_dim"], skip_mask_check: bool = False
+    ) -> Tuple[TensorType["state_dim","action_dim"], TensorType["action_dim"], bool]:
         """
         Executes step given an action.
 
@@ -522,8 +618,8 @@ class GFlowNetEnv:
         return None, None, None
 
     def step_backwards(
-        self, action: Tuple[int], skip_mask_check: bool = False
-    ) -> Tuple[List[int], Tuple[int], bool]:
+        self, action: TensorType["action_dim"], skip_mask_check: bool = False
+    ) -> Tuple[TensorType["state_dim","action_dim"], TensorType["action_dim"], bool]:
         """
         Executes a backward step given an action. This generic implementation should
         work for all discrete environments, as it relies on get_parents(). Continuous
@@ -801,7 +897,7 @@ class GFlowNetEnv:
         state : list
             The final state.
 
-        action: list
+        action: TensorType["action_dim"]
             The list of actions (tuples) in the trajectory.
         """
         actions = []

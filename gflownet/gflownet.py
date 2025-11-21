@@ -201,7 +201,7 @@ class GFlowNetAgent:
         # Evaluator
         self.evaluator = evaluator
         self.evaluator.set_agent(self)
-        optimizer.n_train_steps = 100
+        # optimizer.n_train_steps = 100
         self.n_train_steps = optimizer.n_train_steps
         self.batch_size = optimizer.batch_size
         self.batch_size_total = sum(self.batch_size.values())
@@ -623,7 +623,6 @@ class GFlowNetAgent:
             # Update environments with sampled actions
             envs, actions, valids = self.step(envs, actions)
             # Add to batch
-            actions_torch = torch.tensor(actions)
             batch_forward.add_to_batch(
                 envs, actions, logprobs, logprobs_rev, valids, train=train
             )

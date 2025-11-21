@@ -9,6 +9,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import torch
+import time
 from hydra import compose, initialize_config_dir
 from hydra.utils import get_original_cwd, instantiate
 from omegaconf import DictConfig, OmegaConf
@@ -240,36 +241,28 @@ def read_hydra_config(rundir=None, config_name="config"):
 def gflownet_from_config(config, env=None):
     """
     Create GFlowNet from a Hydra OmegaConf config.
-
-    Parameters
-    ----------
-    config : DictConfig
-        Config.
-
-    env : GFlowNetEnv
-        Optional environment instance to be used in the initialization.
-
-    Returns
-    -------
-    GFN
-        GFlowNet.
     """
+    total_start = time.perf_counter()
+
     # Logger
+    print("Initializing logger...")
+    t0 = time.perf_counter()
     logger = instantiate(config.logger, config, _recursive_=False)
+    print(f"Logger initialized. (took {time.perf_counter() - t0:.3f}s)")
 
     # The proxy is required by the GFlowNetAgent for computing rewards
+    print("Initializing proxy...")
+    t0 = time.perf_counter()
     proxy = instantiate(
         config.proxy,
         device=config.device,
         float_precision=config.float_precision,
     )
+    print(f"Proxy initialized. (took {time.perf_counter() - t0:.3f}s)")
 
-    # Using Hydra's partial instantiation, see:
-    # https://hydra.cc/docs/advanced/instantiate_objects/overview/#partial-instantiation
-    # If env is passed as an argument, we create an env maker with a partial
-    # instantiation from the copy method of the environment (this is used in unit
-    # tests, for example). Otherwise, we create the env maker with partial
-    # instantiation from the config.
+    # Environment maker
+    print("Initializing environment maker...")
+    t0 = time.perf_counter()
     if env is not None:
         env_maker = partial(env.copy)
     else:
@@ -280,21 +273,28 @@ def gflownet_from_config(config, env=None):
             _partial_=True,
         )
         env = env_maker()
+    print(f"Environment maker initialized. (took {time.perf_counter() - t0:.3f}s)")
 
-    # TOREVISE: set up proxy so when buffer calls it (when it creates train / test
-    # dataset) it has the correct infro from env
-    # proxy.setup(env)
+    # Buffer
+    print("Initializing buffer...")
+    t0 = time.perf_counter()
     buffer = instantiate(
         config.buffer,
         env=env,
         proxy=proxy,
         datadir=logger.datadir,
     )
+    print(f"Buffer initialized. (took {time.perf_counter() - t0:.3f}s)")
 
-    # The evaluator is used to compute metrics and plots
+    # Evaluator
+    print("Initializing evaluator...")
+    t0 = time.perf_counter()
     evaluator = instantiate(config.evaluator)
+    print(f"Evaluator initialized. (took {time.perf_counter() - t0:.3f}s)")
 
-    # The policy is used to model the probability of a forward/backward action
+    # Policies
+    print("Initializing policies...")
+    t0 = time.perf_counter()
     forward_config = parse_policy_config(config, kind="forward")
     backward_config = parse_policy_config(config, kind="backward")
 
@@ -311,9 +311,12 @@ def gflownet_from_config(config, env=None):
         float_precision=config.float_precision,
         base=forward_policy,
     )
+    print(f"Policies initialized. (took {time.perf_counter() - t0:.3f}s)")
 
     # State flow
     if config.gflownet.state_flow is not None:
+        print("Initializing state_flow...")
+        t0 = time.perf_counter()
         state_flow = instantiate(
             config.gflownet.state_flow,
             env=env,
@@ -321,10 +324,13 @@ def gflownet_from_config(config, env=None):
             float_precision=config.float_precision,
             base=forward_policy,
         )
+        print(f"State_flow initialized. (took {time.perf_counter() - t0:.3f}s)")
     else:
         state_flow = None
 
     # Loss
+    print("Initializing loss...")
+    t0 = time.perf_counter()
     loss = instantiate(
         config.loss,
         forward_policy=forward_policy,
@@ -333,8 +339,11 @@ def gflownet_from_config(config, env=None):
         device=config.device,
         float_precision=config.float_precision,
     )
+    print(f"Loss initialized. (took {time.perf_counter() - t0:.3f}s)")
 
     # GFlowNet Agent
+    print("Initializing GFlowNet agent...")
+    t0 = time.perf_counter()
     gflownet = instantiate(
         config.gflownet,
         device=config.device,
@@ -349,6 +358,10 @@ def gflownet_from_config(config, env=None):
         logger=logger,
         evaluator=evaluator,
     )
+    print(f"GFlowNet agent initialized. (took {time.perf_counter() - t0:.3f}s)")
+
+    total_elapsed = time.perf_counter() - total_start
+    print(f"gflownet_from_config completed in {total_elapsed:.3f}s")
 
     return gflownet
 

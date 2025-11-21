@@ -33,10 +33,10 @@ def main(config):
 
     # Initialize a GFlowNet agent from the configuration file
     gflownet = gflownet_from_config(config)
-
+    print("Initialized GFlowNet agent:\nTraining...")
     # Train GFlowNet
     gflownet.train()
-
+    print("\nTraining completed.\n")
     # Sample from trained GFlowNet
     # TODO: move to method in GFlowNet agent, like sample_and_log()
     if config.n_samples > 0 and config.n_samples <= 1e5:

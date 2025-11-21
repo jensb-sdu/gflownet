@@ -203,11 +203,12 @@ def score_grouping_and_separation(coordinates: torch.TensorType,
     labels = torch.as_tensor(labels)
 
     # Drop recordings that contain NaNs in any feature (these correspond to invalid / padded segments)
-    valid_rows = ~torch.isnan(coordinates).any(dim=1)
-    if valid_rows.numel() == 0 or valid_rows.sum() == 0:
-        raise ValueError("No valid (non-NaN) recordings available for this group")
-    coordinates = coordinates[valid_rows]
-    labels = labels[valid_rows]
+    invalid_rows = torch.isnan(coordinates).any(dim=1)
+    if invalid_rows.any():
+        # raise ValueError("Invalid (NaN) recordings available for this group")
+        return torch.tensor(0.0)  # Return zero score if invalid recordings are present
+    # coordinates = coordinates[valid_rows]
+    # labels = labels[valid_rows]
 
     # Get indices for each class
     label_1_mask = labels == 1
