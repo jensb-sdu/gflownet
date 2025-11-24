@@ -502,8 +502,182 @@ def plot_gfn_functions_3D(sample_path, n_points=1000):
     plt.savefig("gfn_functions_3D.png")
     plt.close()  
 
+def find_best_function_sample(sample_path):
+    """
+    Find the function sample with the highest energy from GFlowNet samples.
+    """
+    readable_list, energies = read_gfn_samples(sample_path)
+    max_energy_idx = np.argmax(energies)
+    best_function = readable_list[max_energy_idx]
+    best_energy = energies[max_energy_idx]
+    return best_function, best_energy
+
+def display_best_function_over_curve(sample_path, labels, forces, number_of_curves = 10):
+    best_function, best_energy = find_best_function_sample(sample_path)
+
+    #parse best function into state tensor
+    import re
+    matches = re.findall(r'([A-Za-z0-9_+-]+)\[(\d+),\s*(\d+)\]', best_function)
+    state_list = []
+    for name, a, b in matches:
+        a = int(a)
+        b = int(b)
+        func = None
+        for i, f in enumerate(FUNCTIONS, start=1):
+            if callable(f) and hasattr(f, "__name__"):
+                fname = f.__name__
+            else:
+                fname = str(f)
+            if fname == name:
+                func = fname
+                func_idx = i
+                break
+        if func is not None:
+            state_list.append([func, func_idx, a, b])
+
+    # Visualize on a subset of sample force curves
+    sample_forces = forces[:number_of_curves]
+    sample_labels = labels[:number_of_curves]
+
+    plt.figure(figsize=(10,5))
+    ax = plt.gca()
+
+    # Plot force curves with function overlays
+    # collect numeric arrays to compute axis extents for annotation placement
+    numeric_forces = []
+    for i in range(len(sample_forces)):
+        sample_force = sample_forces[i]
+        sample_label = sample_labels[i]
+        if torch.is_tensor(sample_force):
+            arr = sample_force.detach().cpu().numpy()
+        else:
+            arr = np.asarray(sample_force)
+        numeric_forces.append(arr)
+        # Plot individual force curve color coded by label
+        ax.plot(arr, color = 'green' if sample_label == 1 else 'red', alpha=0.3)
+
+    # determine y placement for the dimension annotation
+    ymax = 0.0
+    ymin = -80.0
+    y_offset = (ymax - ymin) / len(proxy.func_dict)
+
+    cmap = plt.get_cmap('viridis')
+    # fallback to FUNCTIONS length (proxy not passed here)
+    n_funcs = len(FUNCTIONS)
+    norm = plt.Normalize(vmin=0, vmax=max(1, n_funcs - 1))
+
+    for idx, func in enumerate(state_list):
+        func_name, func_idx, start, end = func
+        color = cmap(norm(func_idx))
+        # Overlay function region color coded by function index
+        ax.axvspan(start, end, alpha=0.3, label=f'{func_idx}: {func_name} [{start}, {end}]', color=color)
+        # add vertical markers at boundaries
+        ax.axvline(start, color=color, linestyle='--', alpha=0.6)
+        ax.axvline(end, color=color, linestyle='--', alpha=0.6)
+        y_text = ymax - (idx * y_offset)
+        # add dimension annotation of the format |--dimension--| centered across the span
+        dim_text = f" {func_name}"
+        ax.text((start + end) / 2.0, y_text, dim_text, ha='center', va='bottom',
+                fontsize=9, color='black')
+        ax.axhline( y = y_text - 5, xmin = start, xmax= end, color='black', linestyle='--', alpha=0.5)
+
+    ax.set_title('Best GFlowNet Function Applied to Sample Force Curve')
+    ax.set_xlabel('Time')
+    ax.set_ylabel('Force')
+    ax.legend()
+    ax.grid(True)
+    plt.savefig("best_function_on_force_curve.png")
+    plt.close()
+    print("Best function visualization saved.")
 
 
+def plot_best_function_coordinates_UMAP(best_function, proxy):
+    #parse best function into state tensor
+    import re
+    matches = re.findall(r'([A-Za-z0-9_+-]+)\[(\d+),\s*(\d+)\]', best_function)
+    state_list = []
+    for name, a, b in matches:
+        a = int(a)
+        b = int(b)
+        func_idx = None
+        for i, f in enumerate(FUNCTIONS, start=1):
+            if callable(f) and hasattr(f, "__name__"):
+                fname = f.__name__
+            else:
+                fname = str(f)
+            if fname == name:
+                func_idx = i
+                break
+        if func_idx is not None:
+            state_list.append([func_idx, a, b])
+    
+    state_tensor = torch.tensor([state_list], dtype=torch.int16, device=proxy.device)
+    coordinates = proxy.apply_functions(state_tensor)
+
+    # Convert coordinates to numpy for UMAP
+    coords_np = coordinates.detach().cpu().numpy()  # e.g. shape (1, n_funcs, n_recordings) or similar
+    try:
+        import umap
+    except Exception:
+        raise ImportError("umap-learn is required for UMAP dimensionality reduction")
+    reducer = umap.UMAP(n_components=2, random_state=42)
+
+    # Remove possible batch dim
+    if coords_np.ndim == 3 and coords_np.shape[0] == 1:
+        coords_np = coords_np[0]  # now (n_funcs, n_recordings) or (n_recordings, n_funcs)
+    elif coords_np.ndim == 3:
+        # If multiple batches present, flatten batch and funcs into samples
+        b, f, r = coords_np.shape
+        coords_np = coords_np.reshape(b * f, r)
+
+    # Prepare labels as numpy 1D array
+    labels_arr = proxy.labels
+    if isinstance(labels_arr, torch.Tensor):
+        labels_arr = labels_arr.detach().cpu().numpy()
+    labels_arr = np.asarray(labels_arr).reshape(-1)
+
+    # Determine whether rows correspond to recordings or functions and align to labels
+    # If number of rows matches labels -> good. Else if number of columns matches labels -> transpose.
+    if coords_np.shape[0] == labels_arr.shape[0]:
+        samples = coords_np  # rows are samples
+    elif coords_np.shape[1] == labels_arr.shape[0]:
+        samples = coords_np.T
+    else:
+        # Last resort: try flattening per-recording if possible (e.g. each recording expanded over funcs)
+        # If total elements equal labels * k, reshape to (labels, -1)
+        total = coords_np.size
+        if labels_arr.shape[0] > 0 and total % labels_arr.shape[0] == 0:
+            samples = coords_np.reshape(labels_arr.shape[0], -1)
+        else:
+            raise ValueError(f"Cannot align coordinates shape {coords_np.shape} with labels shape {labels_arr.shape}")
+
+    # Run UMAP
+    reduced_coords = reducer.fit_transform(samples)
+
+    # Build boolean masks for indexing reduced_coords (length must match reduced_coords.shape[0])
+    bad_mask = (labels_arr == 0)
+    good_mask = (labels_arr == 1)
+    if reduced_coords.shape[0] != bad_mask.shape[0]:
+        # If masks still do not match, try to broadcast by repeating per-chunk if possible
+        raise IndexError(f"Label length {bad_mask.shape[0]} does not match reduced samples {reduced_coords.shape[0]}")
+
+    reduced_bad = reduced_coords[bad_mask]
+    reduced_good = reduced_coords[good_mask]
+
+    # Plot
+    plt.figure(figsize=(10, 8))
+    if reduced_bad.size:
+        plt.scatter(reduced_bad[:, 0], reduced_bad[:, 1], c='red', label='Bad', alpha=0.7)
+    if reduced_good.size:
+        plt.scatter(reduced_good[:, 0], reduced_good[:, 1], c='green', label='Good', alpha=0.7)
+    plt.title('Function Coordinates in UMAP Space')
+    plt.xlabel('UMAP Dimension 1')
+    plt.ylabel('UMAP Dimension 2')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig("function_coordinates_umap.png")
+    plt.close()
+    print("Function coordinates UMAP plot saved.")
 
 
 if __name__ == "__main__":
@@ -512,3 +686,31 @@ if __name__ == "__main__":
     plot_gfn_samples_umap(sample_path, n_points=1000)
     plot_gfn_functions_3D(sample_path, n_points=1000)
     print("Plots saved.")
+    print("Finding best function sample...")
+    best_function, best_energy = find_best_function_sample(sample_path)
+    print(f"Best function: {best_function} with energy: {best_energy}")
+
+    print("Generating environment and proxy for visualization...")
+    #apply best function to verification env and visualize
+    from gflownet.proxy.verification_proxy import VerificationProxy
+    from gflownet.envs.verification_env import VerificationEnv
+    env = VerificationEnv(data_path="/home/dmd_user/Desktop/ECAA/gfn_verification/csv_data/csv_real_robot_sdu/csv_real_robot_admittance", device = "cuda" if torch.cuda.is_available() else "cpu", window_size=1024, min_function_width=32, max_length=8)
+    proxy = VerificationProxy(reward_min=1.0, do_clip_rewards=False, device = "cuda" if torch.cuda.is_available() else "cpu")
+
+    proxy.setup(env)
+
+    print("Displaying best function over sample force curves...")
+    display_best_function_over_curve(sample_path, proxy.labels, proxy.all_forces, number_of_curves = 10)
+
+    print("Plotting best function coordinates in UMAP space...")
+    plot_best_function_coordinates_UMAP(best_function, proxy)
+
+
+
+
+
+
+
+
+
+
