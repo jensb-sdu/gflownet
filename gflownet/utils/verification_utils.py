@@ -559,7 +559,7 @@ def display_best_function_over_curve(sample_path, labels, forces, number_of_curv
     # determine y placement for the dimension annotation
     ymax = 0.0
     ymin = -80.0
-    y_offset = (ymax - ymin) / len(proxy.func_dict)
+    y_offset = (ymax - ymin) / len(state_list)
 
     cmap = plt.get_cmap('viridis')
     # fallback to FUNCTIONS length (proxy not passed here)
@@ -568,23 +568,23 @@ def display_best_function_over_curve(sample_path, labels, forces, number_of_curv
 
     for idx, func in enumerate(state_list):
         func_name, func_idx, start, end = func
-        color = cmap(norm(func_idx))
+        color = cmap(norm(idx))
         # Overlay function region color coded by function index
-        ax.axvspan(start, end, alpha=0.3, label=f'{func_idx}: {func_name} [{start}, {end}]', color=color)
+        #ax.axvspan(start, end, alpha=0.3, label=f'{func_idx}: {func_name} [{start}, {end}]', color=color)
         # add vertical markers at boundaries
         ax.axvline(start, color=color, linestyle='--', alpha=0.6)
         ax.axvline(end, color=color, linestyle='--', alpha=0.6)
         y_text = ymax - (idx * y_offset)
-        # add dimension annotation of the format |--dimension--| centered across the span
-        dim_text = f" {func_name}"
+        # add dimension annotation of the format  func_name     centered across the span
+        #                                       |-----------| 
+        dim_text = f"{idx}: {func_name}"
         ax.text((start + end) / 2.0, y_text, dim_text, ha='center', va='bottom',
-                fontsize=9, color='black')
-        ax.axhline( y = y_text - 5, xmin = start, xmax= end, color='black', linestyle='--', alpha=0.5)
+                fontsize=9, color=color)
+        ax.plot([start, end], [y_text - 1, y_text - 1], linestyle = "--", color=color, alpha=0.5, linewidth=2)
 
     ax.set_title('Best GFlowNet Function Applied to Sample Force Curve')
     ax.set_xlabel('Time')
     ax.set_ylabel('Force')
-    ax.legend()
     ax.grid(True)
     plt.savefig("best_function_on_force_curve.png")
     plt.close()
