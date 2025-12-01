@@ -499,6 +499,30 @@ class VerificationEnv(GFlowNetEnv) :
         return self.states2proxy(states).flatten(start_dim=1).to(self.float)
 
 
+    def readable2state(self, readable):
+        import re
+        matches = re.findall(r'([A-Za-z0-9_+-]+)\[(\d+),\s*(\d+)\]', readable)
+        state_list = []
+        for name, a, b in matches:
+            a = int(a)
+            b = int(b)
+            func_idx = None
+            for i, f in enumerate(self.functions, start=1):
+                if callable(f) and hasattr(f, "__name__"):
+                    fname = f.__name__
+                else:
+                    fname = str(f)
+                if fname == name:
+                    func_idx = i
+                    break
+            if func_idx is not None:
+                state_list.append([func_idx, a, b])
+        
+        state_tensor = torch.tensor([state_list], dtype=torch.int16, device=self.device)
+
+        return state_tensor
+
+
     def _pad(self, state: TensorType["state_dim", "action_dim"]):
         """
         Pads a sequence represented as a list of indices.

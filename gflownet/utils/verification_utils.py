@@ -11,7 +11,14 @@ from matplotlib import pyplot as plt
 from itertools import combinations
 from torch.distributions import Categorical
 from gflownet.envs.verification_env import FUNCTIONS
+import csv
+import os
 #import umap
+
+
+
+from datetime import datetime
+
 
 class ForceDataset(Dataset):
     def __init__(self, directory = None, transform=None, window_size = 1024, sim_data = False, filter = False):
@@ -40,8 +47,16 @@ class ForceDataset(Dataset):
         return forces, label
     
     def load_forces(self, directory):
-        self.labeled_forces = self.get_full_dataframe_from_directory(directory)
-
+        if directory is not None:
+            dir = Path(directory)
+        else:
+            dir = self.directory
+        try :
+            self.labeled_forces = self.get_full_dataframe_from_directory(dir)
+        except Exception as e:
+            print(f"Error loading forces from directory {dir}: {e}")
+            self.labeled_forces = pd.DataFrame()
+            raise e
 
     def get_full_dataframe_from_directory(self, directory_path):
         """
@@ -117,6 +132,262 @@ class ForceDataset(Dataset):
             split_data.append(torch.stack(splits))
                 
         return torch.stack(split_data)
+
+class ForceDisplacementDataset(ForceDataset):
+    def __init__(self, directory = None, transform=None, AlignmentX = 50, window_size = 128):
+
+        self.AlignmentX = AlignmentX  # Force threshold for alignment
+
+        super().__init__(directory, transform, window_size)
+
+
+    def legend_without_duplicate_labels(self, ax):
+        handles, labels = ax.get_legend_handles_labels()
+        unique = [(h, l) for i, (h, l) in enumerate(zip(handles, labels)) if l not in labels[:i]]
+        ax.legend(*zip(*unique),fontsize=10)
+
+
+
+    def get_full_dataframe_from_directory(self, directory_path):
+        """
+        Parallelized version of get_fulldatafrane_from_directory.
+        Processes all files in the directory and combines them into a single DataFrame.
+        Since the folder structure is different for force-displacement data, find all subfolders first.
+        Use the folder names as labels for the data.
+        """
+        # Find all subfolders in the directory
+        subfolders = [f.path for f in os.scandir(directory_path) if f.is_dir()]
+
+        # Find subfolder named good or reference to use as label 1
+        label_map = {}
+        for subfolder in subfolders:
+            folder_name = os.path.basename(subfolder).lower()
+            if 'good' in folder_name or 'reference' in folder_name:
+                label_map[subfolder] = 1
+            else:
+                label_map[subfolder] = 0
+        
+        # each sub folder contains folders from different tests
+        files = []
+        for subfolder in subfolders:
+            for f in os.scandir(subfolder):
+                if f.is_file():
+                    files.append((f.path, label_map[subfolder]))  # Store file path with its label
+        
+        # Use ProcessPoolExecutor for parallel processing     
+        with ProcessPoolExecutor() as executor:
+            # Map the process_file function to the list of files
+            dataframes = list(executor.map(self.process_file, files))
+
+        # Ensure all elements in dataframes are DataFrames
+        for i, df in enumerate(dataframes):
+            if not isinstance(df, pd.DataFrame):
+                print(f"Error: Output of process_file for file {files[i]} is not a DataFrame. Got: {type(df)}")
+                continue
+
+        # Combine all DataFrames into a single DataFrame
+        #full_dataframe = pd.concat(dataframes, ignore_index=False)
+        return pd.concat(dataframes, ignore_index=True)
+        
+
+    # Functions to read csv file data no matter the maXYmos firmware version  
+    def read_csv_first_six_lines(self, filename):
+        first_six_lines = []
+
+        with open(filename, mode='r', newline='', encoding='utf-8') as file:
+            reader = csv.reader(file, delimiter='\t')
+
+            for _ in range(6):
+                first_six_lines.append(next(reader))
+
+        keys = first_six_lines[4][0].split(';')
+        values = first_six_lines[5][0].split(';')
+
+        data_dict = {key: value for key, value in zip(keys, values)}
+
+        return first_six_lines, data_dict
+
+    def read_lines_until_empty(self, filename):
+
+        if filename.endswith(".csv"): 
+            first_six_lines, data_dict = self.read_csv_first_six_lines(filename)
+
+            keys_to_extract = ["Measuring points"]
+            start_indices = [data_dict[key] for key in keys_to_extract if key in data_dict]
+
+            with open(filename, mode='r', newline='', encoding='utf-8') as file:
+                reader = csv.reader(file, delimiter='\t')
+
+                for start_index in start_indices:
+                    start_index = int(start_index)
+                    lines = []
+                    file.seek(0)  
+                    for i, row in enumerate(reader, start=1):
+                        if i >= start_index:
+                            if not any(row):  # Check if the row is empty
+                                break
+                            split_row = row[0].split(';') if row else []
+                            lines.append(split_row)
+            return np.array(lines, dtype='str')
+        return np.array([])
+
+
+
+    def find_min_and_index(self, data):
+        """
+        Returns the minimum value and its index from a list or numpy array.
+        
+        Parameters:
+            data (list or np.ndarray): Input data.
+            
+        Returns:
+            tuple: (min_value, index)
+        """
+        data_array = np.array(data)
+        min_index = np.argmin(data_array)
+        min_value = data_array[min_index]
+        return min_value, min_index
+
+
+    def process_file(self, file_path):
+        data_sorted = [[] * 2]  # Only need displacement and load
+        data_before_alignment = [[] * 2]  # Store unaligned data
+        data = self.read_lines_until_empty(file_path)
+                    
+        # Vectorized conversion from string to float
+        load = np.array([float(data[j,2].replace(",",".")) for j in range(len(data))])
+        disp = np.array([float(data[j,1].replace(",",".")) for j in range(len(data))])
+        
+        # Store original unaligned data
+        data_before_alignment[0].append(disp.copy())
+        data_before_alignment[1].append(load.copy())
+        
+        # Align on the x axis - set x=0 at first threshold crossing
+        idx_above = np.where(load > self.AlignmentX)[0]
+        if len(idx_above) > 0:
+            threshold_idx = idx_above[0]  # First time load crosses threshold
+            disp = disp - disp[threshold_idx]  # Set this point as x=0
+        
+        data_sorted[0].append(disp)
+        data_sorted[1].append(load)
+
+        file_df = pd.DataFrame({'data':[ (data_sorted[0][0], data_sorted[1][0]) ], 'label': int(os.path.basename(os.path.dirname(file_path)).lower() in ['good','reference'])})
+
+        return file_df
+
+
+    def load_and_process_force_data(self ):
+        
+        # Folder and file names
+        #folder_Data = str(path) + "/test/Data_aspect-ratio/" # Folder containing good files must be names "Good" and be located in script folder
+        
+      
+        # Ensure path exists
+        folder_Data = os.path.abspath(self.directory)
+        # Raise error if path does not exist
+        if not os.path.exists(folder_Data):
+            raise FileNotFoundError(f"The specified folder does not exist: {folder_Data}")
+
+
+        Results_folder = self.directory / "Plots" # Folder for output of result files
+        # Ensure results folder exists
+        Results_folder = os.path.abspath(Results_folder)
+        if not os.path.exists(Results_folder):
+            os.makedirs(Results_folder)
+            
+
+        print(f"Getting data from folder: {folder_Data}")
+
+       
+
+        #############################################
+        ############ Save/load structure ############
+        #############################################
+
+        now = str(datetime.now())
+        now = now.replace(" ", "_")
+        now = now.replace(":", "-")
+
+
+        # Find paths of all subfolders in folder_Data# 
+        subfolders = [f.path for f in os.scandir(folder_Data) if f.is_dir()]
+
+        extension = '.csv'
+        colorvector = ["Green","Black","Blue","Red","purple","teal","Orange","Lightblue","magenta"]
+
+        #############################################
+        ########### Load data from files ############
+        #############################################
+
+
+        # Dictionary to store raw data before and after alignment
+        raw_data_dict = {}
+
+        # loop through all folders
+        for subfolder in subfolders:
+
+            # Extract folder name from path (get the last folder name)
+            folder_name = os.path.basename(subfolder)
+            
+            # Skip if this is the root data folder itself
+            if folder_name == 'Data_aspect-ratio':
+                continue
+            
+            # Get only CSV files
+            fileNames = [fn for fn in os.listdir(subfolder) if fn.endswith(extension)]
+            nof = len(fileNames)
+            
+            if nof > 0:
+                data_sorted = [[] for _ in range(2)]  # Only need displacement and load
+                data_before_alignment = [[] for _ in range(2)]  # Store unaligned data
+                
+                # Load all data from the data files in the current folder
+                for fname in fileNames:
+                    self.process_file(Path(subfolder) / fname)
+                
+                # Store both aligned and unaligned data
+                raw_data_dict[folder_name] = {
+                    'before': data_before_alignment,
+                    'after': data_sorted
+                }
+                fig, ax = plt.subplots(figsize=(8, 6))
+                for i in range(nof):
+                    disp_i = data_sorted[0][i]
+                    load_i = data_sorted[1][i]
+                    
+                    # Remove initial points where displacement goes backward (right to left)
+                    # Find where displacement starts consistently increasing
+                    start_idx = 0
+                    for j in range(1, len(disp_i)):
+                        # Look for the point where displacement starts increasing consistently
+                        if j < len(disp_i) - 5:  # Need at least 5 points ahead
+                            # Check if next 5 points show increasing trend
+                            if all(disp_i[j+k] > disp_i[j] for k in range(1, min(5, len(disp_i)-j))):
+                                start_idx = j
+                                break
+                    
+                    # Use data only from start_idx onward
+                    disp_i = disp_i[start_idx:]
+                    load_i = load_i[start_idx:]
+
+                    #add to plot
+                    ax.plot(disp_i, load_i, color=colorvector[f % len(colorvector)], alpha=0.5)
+                
+                ax.set_title(f'Force-Displacement Curves - {folder_name}')
+                ax.set_xlabel('Displacement (deg)')
+                ax.set_ylabel('Force (N)')
+                # show plot
+                plt.savefig(f"{Results_folder}Force-Displacement_Curves_{folder_name}.png", dpi=300)
+                plt.close()
+
+                print(f"Processed folder: {folder_name} with {nof} files.")
+                # Compute avg length after alignment
+                lengths = [len(data_sorted[0][i]) for i in range(nof)]
+                avg_length = int(np.mean(lengths))
+
+                print(f"Average length of aligned curves in folder '{folder_name}': {avg_length} points.")
+
+
 
 
 class LargeCategorical(Categorical):
@@ -512,32 +783,16 @@ def find_best_function_sample(sample_path):
     best_energy = energies[max_energy_idx]
     return best_function, best_energy
 
-def display_best_function_over_curve(sample_path, labels, forces, number_of_curves = 10):
+def display_best_function_over_curve(sample_path, proxy, env, number_of_curves = 10):
     best_function, best_energy = find_best_function_sample(sample_path)
 
-    #parse best function into state tensor
-    import re
-    matches = re.findall(r'([A-Za-z0-9_+-]+)\[(\d+),\s*(\d+)\]', best_function)
-    state_list = []
-    for name, a, b in matches:
-        a = int(a)
-        b = int(b)
-        func = None
-        for i, f in enumerate(FUNCTIONS, start=1):
-            if callable(f) and hasattr(f, "__name__"):
-                fname = f.__name__
-            else:
-                fname = str(f)
-            if fname == name:
-                func = fname
-                func_idx = i
-                break
-        if func is not None:
-            state_list.append([func, func_idx, a, b])
+    
+    state_tensor = env.readable2state(best_function)
 
+    state_list = state_tensor.tolist()[0]  # assuming batch size 1
     # Visualize on a subset of sample force curves
-    sample_forces = forces[:number_of_curves]
-    sample_labels = labels[:number_of_curves]
+    sample_forces = proxy.all_forces[:number_of_curves]
+    sample_labels = proxy.labels[:number_of_curves]
 
     plt.figure(figsize=(10,5))
     ax = plt.gca()
@@ -567,7 +822,7 @@ def display_best_function_over_curve(sample_path, labels, forces, number_of_curv
     norm = plt.Normalize(vmin=0, vmax=max(1, n_funcs - 1))
 
     for idx, func in enumerate(state_list):
-        func_name, func_idx, start, end = func
+        func_idx, start, end = func
         color = cmap(norm(idx))
         # Overlay function region color coded by function index
         #ax.axvspan(start, end, alpha=0.3, label=f'{func_idx}: {func_name} [{start}, {end}]', color=color)
@@ -577,7 +832,8 @@ def display_best_function_over_curve(sample_path, labels, forces, number_of_curv
         y_text = ymax - (idx * y_offset)
         # add dimension annotation of the format  func_name     centered across the span
         #                                       |-----------| 
-        dim_text = f"{idx}: {func_name}"
+        cur_func = proxy.func_dict.get(func_idx, None)
+        dim_text = f"{idx}: {cur_func.__name__ if callable(cur_func) else str(cur_func)}"
         ax.text((start + end) / 2.0, y_text, dim_text, ha='center', va='bottom',
                 fontsize=9, color=color)
         ax.plot([start, end], [y_text - 1, y_text - 1], linestyle = "--", color=color, alpha=0.5, linewidth=2)
@@ -591,27 +847,9 @@ def display_best_function_over_curve(sample_path, labels, forces, number_of_curv
     print("Best function visualization saved.")
 
 
-def plot_best_function_coordinates_UMAP(best_function, proxy):
+def plot_best_function_coordinates_UMAP(best_function, proxy, env):
     #parse best function into state tensor
-    import re
-    matches = re.findall(r'([A-Za-z0-9_+-]+)\[(\d+),\s*(\d+)\]', best_function)
-    state_list = []
-    for name, a, b in matches:
-        a = int(a)
-        b = int(b)
-        func_idx = None
-        for i, f in enumerate(FUNCTIONS, start=1):
-            if callable(f) and hasattr(f, "__name__"):
-                fname = f.__name__
-            else:
-                fname = str(f)
-            if fname == name:
-                func_idx = i
-                break
-        if func_idx is not None:
-            state_list.append([func_idx, a, b])
-    
-    state_tensor = torch.tensor([state_list], dtype=torch.int16, device=proxy.device)
+    state_tensor = env.readable2state(best_function)
     coordinates = proxy.apply_functions(state_tensor)
 
     # Convert coordinates to numpy for UMAP
@@ -680,6 +918,9 @@ def plot_best_function_coordinates_UMAP(best_function, proxy):
     print("Function coordinates UMAP plot saved.")
 
 
+
+
+
 if __name__ == "__main__":
     sample_path = "/home/dmd_user/Desktop/ECAA/gfn_verification/gflownet/samples/gfn_samples._8_funcs_nan_zero_no_duplicates.csv"
     print("Plotting GFlowNet samples...")
@@ -690,6 +931,8 @@ if __name__ == "__main__":
     best_function, best_energy = find_best_function_sample(sample_path)
     print(f"Best function: {best_function} with energy: {best_energy}")
 
+    
+
     print("Generating environment and proxy for visualization...")
     #apply best function to verification env and visualize
     from gflownet.proxy.verification_proxy import VerificationProxy
@@ -698,19 +941,21 @@ if __name__ == "__main__":
     proxy = VerificationProxy(reward_min=1.0, do_clip_rewards=False, device = "cuda" if torch.cuda.is_available() else "cpu")
 
     proxy.setup(env)
-
+    reward = proxy.__call__(env.readable2state(best_function))
+    print(f"Reward of best function on training dataset: {reward}")
     print("Displaying best function over sample force curves...")
-    display_best_function_over_curve(sample_path, proxy.labels, proxy.all_forces, number_of_curves = 10)
+    display_best_function_over_curve(sample_path, proxy, env, number_of_curves = 10)
 
     print("Plotting best function coordinates in UMAP space...")
-    plot_best_function_coordinates_UMAP(best_function, proxy)
+    plot_best_function_coordinates_UMAP(best_function, proxy, env)
 
 
+    # generate new environment for validation dataset
+    validation_env = VerificationEnv(data_path="/home/dmd_user/Desktop/ECAA/gfn_verification/csv_data/csv_real_robot_sdu/csv_real_robot_position", device = "cuda" if torch.cuda.is_available() else "cpu", window_size=1024, min_function_width=32, max_length=8)
 
+    proxy.setup(validation_env)
 
-
-
-
-
-
+    print("applying best function to validation dataset...")
+    reward = proxy.__call__(env.readable2state(best_function))
+    print(f"Reward of best function on validation dataset: {reward}")
 

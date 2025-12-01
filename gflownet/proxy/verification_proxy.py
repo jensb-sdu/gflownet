@@ -1,18 +1,20 @@
 import torch
 from gflownet.envs.verification_env import VerificationEnv
-from gflownet.utils.verification_utils import ForceDataset
+from gflownet.utils.verification_utils import ForceDataset, ForceDisplacementDataset
 from gflownet.proxy.base import Proxy
 from gflownet.utils.common import tfloat
 
 class VerificationProxy(Proxy) :
     def __init__(self,
-        reward_min: float = 0.0,
+        production_data = False,
+        reward_min: float = 0.1,
         do_clip_rewards: bool = False,
         **kwargs
     ):
         super().__init__(**kwargs)
         self.reward_min = reward_min
         self.do_clip_rewards = do_clip_rewards
+        self.production_data = production_data
         
     
     def setup(self, env: VerificationEnv = None):
@@ -24,7 +26,11 @@ class VerificationProxy(Proxy) :
         The data set has size M
         split the data set into groups of labels
         """
-        self.dataset = ForceDataset(directory=env.data_path, window_size=env.window_size )
+        if self.production_data:
+            self.dataset = ForceDisplacementDataset(directory=env.data_path, window_size=env.window_size )
+        else:
+            self.dataset = ForceDataset(directory=env.data_path, window_size=env.window_size )
+        
         self.func_dict = env.funcidx2token
         
         self.float = torch.float32
@@ -49,7 +55,7 @@ class VerificationProxy(Proxy) :
     def __call__(self, states):
 
 
-        rewards = reward_function(self.apply_functions(states), self.labels, beta=3)
+        rewards = reward_function(self.apply_functions(states), self.labels)
         output = tfloat(rewards, device = self.device, float_type = self.float)
 
         return output 
@@ -77,7 +83,7 @@ class VerificationProxy(Proxy) :
 
         # Build a single tensor of all recorded force traces from the dataset DataFrame.
         # ForceDataset stores tensors under the 'data' column, so stack them into a tensor:
-        if len(self.dataset.labeled_forces) == 0:
+        if len(self.dataset.labeled_forces) == 0 or self.all_forces.numel() == 0:
             raise ValueError("Dataset is empty")
 
         
@@ -236,9 +242,23 @@ def score_grouping_and_separation(coordinates: torch.TensorType,
     # 2. Separation score: minimum distance from any label 1 to any label 0
     distances_between_classes = torch.cdist(label_1_points, label_0_points, p=2)
     min_separation_distance = distances_between_classes.min()
-    separation_score = min_separation_distance  # Higher score for better separation
     
-    # 3. Combined score
-    combined_score = alpha * tightness_score * beta * separation_score
+    
+    
+
+    # Combine scores
+    if tightness_score.isnan() or min_separation_distance.isnan():
+        combined_score = torch.tensor(0.0)
+
+    if tightness_score.isinf() or min_separation_distance.isinf():
+        combined_score = torch.tensor(0.0)
+
+    if min_separation_distance <= 1.0:
+        combined_score = torch.tensor(0.0)
+    
+    else:
+
+        combined_score = alpha * tightness_score + beta * min_separation_distance
+    
     
     return combined_score
