@@ -12,13 +12,21 @@ def PAD_FUNC(**kwargs):
 
     return torch.nan 
 
+# Example of custom functions
+def Yin(input: TensorType, *, dtype: torch.dtype | None = None):
+    return input[0]
+
+def Yout(input: TensorType, *, dtype: torch.dtype | None = None):
+    return input[-1]
+
+
 # list of ucntion to chose from
 FUNCTIONS = tuple(
     [torch.mean,
      torch.max,
      torch.min,
-     torch.std,
-     torch.var,
+     Yin,
+     Yout,
      torch.trapezoid,
      torch.argmin,
      torch.argmax,

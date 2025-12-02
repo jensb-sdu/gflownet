@@ -17,3 +17,6 @@ playground/
 docs/_build/
 logs
 samples/
+assembly_case/
+venv/
+gflownet-env/

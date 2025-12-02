@@ -6,7 +6,7 @@ from gflownet.utils.common import tfloat
 
 class VerificationProxy(Proxy) :
     def __init__(self,
-        production_data = False,
+        production_data = True,
         reward_min: float = 0.1,
         do_clip_rewards: bool = False,
         **kwargs
@@ -19,8 +19,6 @@ class VerificationProxy(Proxy) :
     
     def setup(self, env: VerificationEnv = None):
         """
-        TODO: Implement setup
-
         core idea: 
         fetch the data and sort the dataset by labels (to start with just binary lables)
         The data set has size M
@@ -44,7 +42,13 @@ class VerificationProxy(Proxy) :
             else:
                 label_list.append(int(lbl))
         self.labels = torch.tensor(label_list, device=self.device, dtype=torch.int8)
-        self.all_forces = torch.stack(self.dataset.labeled_forces['data'].tolist(), dim=0)  # (num_recordings, T)
+        if self.production_data:
+            key = 'force'
+        else:
+            key = 'data'
+        
+
+        self.all_forces = torch.stack(self.dataset.labeled_forces[key].tolist(), dim=0)  # (num_recordings, T)
         # Move the force tensor to the proxy device and cast to working float dtype
         self.all_forces = self.all_forces.to(device=self.device, dtype=self.float)
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from matplotlib import pyplot as plt
 from itertools import combinations
 from torch.distributions import Categorical
-from gflownet.envs.verification_env import FUNCTIONS
+
 import csv
 import os
 #import umap
@@ -318,7 +318,7 @@ class ForceDisplacementDataset(ForceDataset):
 
 
 
-        file_df = pd.DataFrame({'force':[load], 'displacement': [disp_new], 'label': int(label)})
+        file_df = pd.DataFrame({'force':[torch.tensor(load.copy(), dtype=torch.float32)], 'displacement': [torch.tensor(disp_new.copy(), dtype=torch.float32)], 'label': int(label)})
 
         return file_df
 
@@ -724,7 +724,7 @@ def plot_gfn_samples_umap(sample_path, n_points=1000):
 
 
 
-def plot_gfn_functions_3D(sample_path, n_points=1000):
+def plot_gfn_functions_3D(sample_path, funcs, n_points=1000):
     """
     Plot GFlowNet sampled functions in 3D space. Each token is shown as a point
     colored by its energy. Uses function indices from FUNCTIONS (verification_env).
@@ -751,7 +751,7 @@ def plot_gfn_functions_3D(sample_path, n_points=1000):
 
     # Map function name -> env index using FUNCTIONS (1-based)
     func_to_idx = {}
-    for i, f in enumerate(FUNCTIONS, start=1):
+    for i, f in enumerate(funcs, start=1):
         if callable(f) and hasattr(f, "__name__"):
             fname = f.__name__
         else:
@@ -865,7 +865,7 @@ def display_best_function_over_curve(sample_path, proxy, env, number_of_curves =
 
     cmap = plt.get_cmap('viridis')
     # fallback to FUNCTIONS length (proxy not passed here)
-    n_funcs = len(FUNCTIONS)
+    n_funcs = len(env.functions)
     norm = plt.Normalize(vmin=0, vmax=max(1, n_funcs - 1))
 
     for idx, func in enumerate(state_list):
@@ -969,7 +969,7 @@ def plot_best_function_coordinates_UMAP(best_function, proxy, env):
 
 
 if __name__ == "__main__":
-    sample_path = "/home/dmd_user/Desktop/ECAA/gfn_verification/gflownet/samples/gfn_samples._8_funcs_nan_zero_no_duplicates.csv"
+    sample_path = "/home/dmd_user/Desktop/ECAA/gflownet/samples/prod_data_y_test.csv"
     print("Plotting GFlowNet samples...")
     plot_gfn_samples_umap(sample_path, n_points=1000)
     plot_gfn_functions_3D(sample_path, n_points=1000)
@@ -979,30 +979,4 @@ if __name__ == "__main__":
     print(f"Best function: {best_function} with energy: {best_energy}")
 
     
-
-    print("Generating environment and proxy for visualization...")
-    #apply best function to verification env and visualize
-    from gflownet.proxy.verification_proxy import VerificationProxy
-    from gflownet.envs.verification_env import VerificationEnv
-    env = VerificationEnv(data_path="/home/dmd_user/Desktop/ECAA/gfn_verification/csv_data/csv_real_robot_sdu/csv_real_robot_admittance", device = "cuda" if torch.cuda.is_available() else "cpu", window_size=1024, min_function_width=32, max_length=8)
-    proxy = VerificationProxy(reward_min=1.0, do_clip_rewards=False, device = "cuda" if torch.cuda.is_available() else "cpu")
-
-    proxy.setup(env)
-    reward = proxy.__call__(env.readable2state(best_function))
-    print(f"Reward of best function on training dataset: {reward}")
-    print("Displaying best function over sample force curves...")
-    display_best_function_over_curve(sample_path, proxy, env, number_of_curves = 10)
-
-    print("Plotting best function coordinates in UMAP space...")
-    plot_best_function_coordinates_UMAP(best_function, proxy, env)
-
-
-    # generate new environment for validation dataset
-    validation_env = VerificationEnv(data_path="/home/dmd_user/Desktop/ECAA/gfn_verification/csv_data/csv_real_robot_sdu/csv_real_robot_position", device = "cuda" if torch.cuda.is_available() else "cpu", window_size=1024, min_function_width=32, max_length=8)
-
-    proxy.setup(validation_env)
-
-    print("applying best function to validation dataset...")
-    reward = proxy.__call__(env.readable2state(best_function))
-    print(f"Reward of best function on validation dataset: {reward}")
 
