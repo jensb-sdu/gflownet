@@ -134,12 +134,19 @@ class ForceDataset(Dataset):
         return torch.stack(split_data)
 
 class ForceDisplacementDataset(ForceDataset):
-    def __init__(self, directory = None, transform=None, AlignmentX = 50, window_size = 128):
+    def __init__(self, directory = None, transform=None, AlignmentX = 50, MinX = -10, MaxX = 30, window_size = 500):
 
         self.AlignmentX = AlignmentX  # Force threshold for alignment
-
+        self.MinX = MinX
+        self.MaxX = MaxX
         super().__init__(directory, transform, window_size)
 
+
+    def __getitem__(self, idx):
+        
+        forces = self.labeled_forces['force'][idx]
+        label = self.labeled_forces['label'][idx] #.unsqueeze_(0)
+        return forces, label
 
     def legend_without_duplicate_labels(self, ax):
         handles, labels = ax.get_legend_handles_labels()
@@ -170,14 +177,23 @@ class ForceDisplacementDataset(ForceDataset):
         # each sub folder contains folders from different tests
         files = []
         for subfolder in subfolders:
-            for f in os.scandir(subfolder):
-                if f.is_file():
-                    files.append((f.path, label_map[subfolder]))  # Store file path with its label
+            for case in os.scandir(subfolder):
+                if case.is_dir():
+                    for f in os.scandir(case.path):
+                        if f.is_file() and f.name.endswith('.csv'):
+                            files.append((f.path, label_map[subfolder]))  # Store file path with its label
         
-        # Use ProcessPoolExecutor for parallel processing     
-        with ProcessPoolExecutor() as executor:
-            # Map the process_file function to the list of files
-            dataframes = list(executor.map(self.process_file, files))
+        # # Use ProcessPoolExecutor for parallel processing     
+        # with ProcessPoolExecutor() as executor:
+        #     # Map the process_file function to the list of files
+        #     dataframes = list(executor.map(self.process_file, files))
+
+
+        dataframes = []
+        for file in files:
+            df = self.process_file(file)
+
+            dataframes.append(df)
 
         # Ensure all elements in dataframes are DataFrames
         for i, df in enumerate(dataframes):
@@ -249,29 +265,60 @@ class ForceDisplacementDataset(ForceDataset):
         return min_value, min_index
 
 
-    def process_file(self, file_path):
-        data_sorted = [[] * 2]  # Only need displacement and load
-        data_before_alignment = [[] * 2]  # Store unaligned data
+    def process_file(self, file):
+        file_path, label = file
         data = self.read_lines_until_empty(file_path)
                     
-        # Vectorized conversion from string to float
+        # Conversion from string to float
         load = np.array([float(data[j,2].replace(",",".")) for j in range(len(data))])
         disp = np.array([float(data[j,1].replace(",",".")) for j in range(len(data))])
         
-        # Store original unaligned data
-        data_before_alignment[0].append(disp.copy())
-        data_before_alignment[1].append(load.copy())
+
         
         # Align on the x axis - set x=0 at first threshold crossing
-        idx_above = np.where(load > self.AlignmentX)[0]
+        idx_above = np.where(load >= self.AlignmentX)[0]
         if len(idx_above) > 0:
             threshold_idx = idx_above[0]  # First time load crosses threshold
             disp = disp - disp[threshold_idx]  # Set this point as x=0
-        
-        data_sorted[0].append(disp)
-        data_sorted[1].append(load)
 
-        file_df = pd.DataFrame({'data':[ (data_sorted[0][0], data_sorted[1][0]) ], 'label': int(os.path.basename(os.path.dirname(file_path)).lower() in ['good','reference'])})
+
+
+
+
+        # Remove initial points goinfing backward (right to left)
+        start_idx = 0
+        for j in range(1, len(disp)):
+            # Look for the point where displacement starts increasing consistently
+            if j < len(disp) - 5:  # Need at least 5 points ahead
+                # Check if next 5 points show increasing trend
+                if all(disp[j+k] > disp[j] for k in range(1, min(5, len(disp)-j))):
+                    start_idx = j
+                    break
+        # Use data only from start_idx onward
+        disp = disp[start_idx:]
+        load = load[start_idx:] 
+
+
+        # Window signal
+        # Cut where disp less or equal to MinX
+        idx_leq = np.where(disp <= self.MinX)[0][-1]
+        idx_geq = np.where(disp >= self.MaxX)[0][0]
+        disp = disp[idx_leq:idx_geq]
+        load = load[idx_leq:idx_geq]
+
+
+
+        if self.window_size is not None:
+            # Interpolate to fixed length
+            disp_new = np.linspace(disp[0], disp[-1], self.window_size) 
+            load = np.interp(disp_new, disp, load)
+        else:
+            disp_new = disp
+
+
+
+
+        file_df = pd.DataFrame({'force':[load], 'displacement': [disp_new], 'label': int(label)})
 
         return file_df
 
