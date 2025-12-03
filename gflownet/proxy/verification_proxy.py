@@ -4,11 +4,16 @@ from gflownet.utils.verification_utils import ForceDataset, ForceDisplacementDat
 from gflownet.proxy.base import Proxy
 from gflownet.utils.common import tfloat
 
+from scipy.spatial import ConvexHull
+import numpy as np
+
 class VerificationProxy(Proxy) :
     def __init__(self,
         production_data = True,
-        reward_min: float = 0.1,
+        reward_min: float = 1.0,
         do_clip_rewards: bool = False,
+        alpha = 1,
+        beta = 1,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -59,9 +64,9 @@ class VerificationProxy(Proxy) :
     def __call__(self, states):
 
 
-        rewards = reward_function(self.apply_functions(states), self.labels)
+        rewards = torch.clamp(reward_function(self.apply_functions(states), self.labels), min=self.reward_min)
         output = tfloat(rewards, device = self.device, float_type = self.float)
-
+        
         return output 
 
 
@@ -171,7 +176,7 @@ def reward_function(grouped_data,
         group_data = torch.transpose(grouped_data[group_idx], 0,1)  
         
         try:
-            score = score_grouping_and_separation(
+            score = score_knn_grouping_and_separation(
                 coordinates=group_data,
                 labels=labels, 
                 alpha=alpha, 
@@ -190,6 +195,64 @@ def reward_function(grouped_data,
     individual_scores = torch.tensor(individual_scores)
 
     return individual_scores    
+
+
+def rank_normalize(data):
+            """
+            Rank-based normalization (quantile normalization).
+            Maps each value to its percentile rank in [0, 1].
+            Robust to any distribution shape.
+            
+            Args:
+                data: torch.Tensor of shape [N, n]
+            Returns:
+                Normalized data of shape [N, n] with values in [0, 1]
+            """
+            N, n_dims = data.shape
+            normalized = torch.zeros_like(data)
+            
+            for dim in range(n_dims):
+                # Get values for this dimension
+                values = data[:, dim]
+                
+                # Compute ranks (argsort twice gives ranks)
+                sorted_indices = torch.argsort(values)
+                ranks = torch.empty_like(sorted_indices, dtype=torch.float32)
+                ranks[sorted_indices] = torch.arange(N, device=values.device, dtype=torch.float32)
+                
+                # Normalize ranks to [0, 1]
+                if N > 1:
+                    normalized[:, dim] = ranks / (N - 1)
+                else:
+                    normalized[:, dim] = 0.5
+            
+            return normalized
+
+
+def IQR_normalize(data):
+    """
+    Robust normalization using median and IQR.
+    Robust to outliers and non-parametric distributions.
+
+    Args:
+        data: torch.Tensor of shape [N, n]
+    Returns:
+        Normalized data of shape [N, n]
+    """
+    median = torch.median(data, dim=0, keepdim=True)[0]  # [1, n]
+
+    # Calculate IQR (Interquartile Range)
+    q75 = torch.quantile(data, 0.75, dim=0, keepdim=True)  # [1, n]
+    q25 = torch.quantile(data, 0.25, dim=0, keepdim=True)  # [1, n]
+    iqr = q75 - q25  # [1, n]
+
+    # Avoid division by zero
+    iqr = torch.where(iqr < 1e-8, torch.ones_like(iqr), iqr)
+
+    # Normalize: (x - median) / IQR
+    normalized = (data - median) / iqr
+
+    return normalized
 
 def score_grouping_and_separation(coordinates: torch.TensorType, 
                                 labels, 
@@ -266,3 +329,126 @@ def score_grouping_and_separation(coordinates: torch.TensorType,
     
     
     return combined_score
+
+
+
+
+def score_knn_grouping_and_separation(coordinates: torch.TensorType,
+                                labels,
+                                alpha=1.0,
+                                beta=1.0,
+                                k=5,
+                                fp_rate_max = 0.01,
+                                fn_rate_max = 0.01):
+    """
+    Score based on false positives and false negatives using k-NN classification.
+    Uses separation distance as a multiplier.
+    
+    Args:
+        coordinates: torch.Tensor of shape [N, n] with point coordinates
+        labels: torch.Tensor of shape [N] with binary labels (0 or 1)
+        alpha: weight for false positive penalty (higher = more penalty for FP)
+        beta: weight for false negative penalty (higher = more penalty for FN)
+        k: number of nearest neighbors to consider
+        
+    Returns:
+        Combined score (higher is better, penalized by FP and FN, multiplied by separation)
+    """
+    # Ensure tensors
+    coordinates = torch.as_tensor(coordinates, dtype=torch.float32)
+    labels = torch.as_tensor(labels)
+    
+    # Drop recordings that contain NaNs in any feature
+    invalid_rows = torch.isnan(coordinates).any(dim=1)
+    if invalid_rows.any():
+        return torch.tensor(0.0)
+    
+    # Get indices for each class
+    label_1_mask = labels == 1
+    label_0_mask = ~label_1_mask
+    
+    if not label_1_mask.any():
+        raise ValueError("No points with label 1 found")
+    if not label_0_mask.any():
+        raise ValueError("No points with label 0 found")
+    
+    label_1_points = coordinates[label_1_mask, :]  # [N1, n]
+    label_0_points = coordinates[label_0_mask, :]  # [N0, n]
+    
+    n_label_1 = len(label_1_points)
+    
+    # Adjust k if needed
+    k_actual = min(k, n_label_1)
+    
+    if k_actual < 1:
+        return torch.tensor(0.0)
+    
+    try:
+        # Compute pairwise distances from all points to label 1 points
+        distances_to_label_1 = torch.cdist(coordinates, label_1_points, p=2)  # [N, N1]
+        
+        # Find k nearest label 1 neighbors for each point
+        k_nearest_distances, _ = torch.topk(distances_to_label_1, k_actual, 
+                                           largest=False, dim=1)  # [N, k]
+        
+        # Average distance to k nearest label 1 points
+        avg_distance_to_label_1 = k_nearest_distances.mean(dim=1)  # [N]
+        
+        # Compute threshold as the maximum average distance among label 1 points
+        # This ensures all label 1 points are "inside" by definition
+        threshold = avg_distance_to_label_1[label_1_mask].max()
+        
+        # Add small margin to avoid numerical issues
+        threshold = threshold * 1.05
+        
+        # Predict labels: points within threshold are predicted as label 1
+        predicted_labels = (avg_distance_to_label_1 <= threshold).long()
+        
+        # Calculate false positives and false negatives
+        false_positives = ((predicted_labels == 1) & (labels == 0)).sum().float()
+        false_negatives = ((predicted_labels == 0) & (labels == 1)).sum().float()
+        
+        # Total number of each class
+        n_label_0 = label_0_mask.sum().float()
+        n_label_1_total = label_1_mask.sum().float()
+        
+        # Calculate FP and FN rates
+        fp_rate = false_positives / n_label_0 if n_label_0 > 0 else torch.tensor(0.0)
+        fn_rate = false_negatives / n_label_1_total if n_label_1_total > 0 else torch.tensor(0.0)
+        
+        # Return 0 score if max tolerated rates are exceeded
+        # if fn_rate <= fn_rate_max and fp_rate <= fp_rate_max :
+        # Classification accuracy component (1 - weighted error rate)
+        error_score = 1.0 - (alpha * fp_rate + beta * fn_rate) / (alpha + beta)
+        error_score = torch.clamp(error_score, min=0.0, max=1.0)
+        
+        # # Normalize dimensions to estiamte "seperability"
+        # coordinates_normalized = IQR_normalize(coordinates)
+        
+        # # Extract normalized points for each label
+        # label_1_points_norm = coordinates_normalized[label_1_mask, :]
+        # label_0_points_norm = coordinates_normalized[label_0_mask, :]
+        
+        # # Calculate separation score on normalized coordinates
+        # distances_between_classes = torch.cdist(label_1_points_norm, label_0_points_norm, p=2)
+        # min_separation_distance = distances_between_classes.min()
+        
+        # Check for invalid values
+        if error_score.isnan(): #or min_separation_distance.isnan():
+            combined_score = torch.tensor(0.0) 
+        elif error_score.isinf(): #or min_separation_distance.isinf():
+            combined_score = torch.tensor(0.0)
+        #elif min_separation_distance <= 0.0:
+            #combined_score = torch.tensor(0.0)
+        else:
+            # Use separation as multiplier
+            combined_score = error_score #* min_separation_distance  
+        # else:
+        #         combined_score = torch.tensor(0.0)
+        
+        return combined_score
+        
+    except Exception as e:
+        print(f"Warning: k-NN computation failed: {e}")
+        raise e
+        #return torch.tensor(0.0)
