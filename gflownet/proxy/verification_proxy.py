@@ -20,6 +20,8 @@ class VerificationProxy(Proxy) :
         self.reward_min = reward_min
         self.do_clip_rewards = do_clip_rewards
         self.production_data = production_data
+        self.alpha = alpha
+        self.beta = beta
         
     
     def setup(self, env: VerificationEnv = None):
@@ -64,7 +66,7 @@ class VerificationProxy(Proxy) :
     def __call__(self, states):
 
 
-        rewards = torch.clamp(reward_function(self.apply_functions(states), self.labels), min=self.reward_min)
+        rewards = torch.clamp(reward_function(self.apply_functions(states), self.labels, alpha=self.alpha, beta = self.beta), min=self.reward_min)
         output = tfloat(rewards, device = self.device, float_type = self.float)
         
         return output 
@@ -337,9 +339,7 @@ def score_knn_grouping_and_separation(coordinates: torch.TensorType,
                                 labels,
                                 alpha=1.0,
                                 beta=1.0,
-                                k=5,
-                                fp_rate_max = 0.01,
-                                fn_rate_max = 0.01):
+                                k=5):
     """
     Score based on false positives and false negatives using k-NN classification.
     Uses separation distance as a multiplier.
@@ -407,42 +407,52 @@ def score_knn_grouping_and_separation(coordinates: torch.TensorType,
         # Calculate false positives and false negatives
         false_positives = ((predicted_labels == 1) & (labels == 0)).sum().float()
         false_negatives = ((predicted_labels == 0) & (labels == 1)).sum().float()
+        true_positives = ((predicted_labels == 1) & (labels == 1)).sum().float()
+        #true_negatives = ((predicted_labels == 0) & (labels == 0)).sum().float()
+
+
+
+        # # # Total number of each class
+        # n_label_0 = label_0_mask.sum().float()
+        # n_label_1_total = label_1_mask.sum().float()
         
-        # Total number of each class
-        n_label_0 = label_0_mask.sum().float()
-        n_label_1_total = label_1_mask.sum().float()
+        # # # Calculate FP and FN rates
+        # fp_rate = false_positives / n_label_0 if n_label_0 > 0 else torch.tensor(0.0)
+        # fn_rate = false_negatives / n_label_1_total if n_label_1_total > 0 else torch.tensor(0.0)
         
-        # Calculate FP and FN rates
-        fp_rate = false_positives / n_label_0 if n_label_0 > 0 else torch.tensor(0.0)
-        fn_rate = false_negatives / n_label_1_total if n_label_1_total > 0 else torch.tensor(0.0)
-        
+        precision = true_positives / (true_positives + false_positives)
+        recall = true_positives / (true_positives + false_negatives)
+
+
         # Return 0 score if max tolerated rates are exceeded
         # if fn_rate <= fn_rate_max and fp_rate <= fp_rate_max :
         # Classification accuracy component (1 - weighted error rate)
-        error_score = 1.0 - (alpha * fp_rate + beta * fn_rate) / (alpha + beta)
-        error_score = torch.clamp(error_score, min=0.0, max=1.0)
+        # error_score = 1.0 - (alpha * fp_rate + beta * fn_rate) / (alpha + beta)
+
+        error_score = 100 * 2*(precision * recall) / (recall + precision) if recall + precision > 1e-8 else 0.0
+        # error_score = torch.clamp(error_score, min=0.0, max=1.0)
         
         # # Normalize dimensions to estiamte "seperability"
-        # coordinates_normalized = IQR_normalize(coordinates)
+        coordinates_normalized = IQR_normalize(coordinates)
         
         # # Extract normalized points for each label
-        # label_1_points_norm = coordinates_normalized[label_1_mask, :]
-        # label_0_points_norm = coordinates_normalized[label_0_mask, :]
+        label_1_points_norm = coordinates_normalized[label_1_mask, :]
+        label_0_points_norm = coordinates_normalized[label_0_mask, :]
         
         # # Calculate separation score on normalized coordinates
-        # distances_between_classes = torch.cdist(label_1_points_norm, label_0_points_norm, p=2)
-        # min_separation_distance = distances_between_classes.min()
+        distances_between_classes = torch.cdist(label_1_points_norm, label_0_points_norm, p=2)
+        min_separation_distance = distances_between_classes.min()
         
         # Check for invalid values
-        if error_score.isnan(): #or min_separation_distance.isnan():
+        if error_score.isnan() or min_separation_distance.isnan():
             combined_score = torch.tensor(0.0) 
-        elif error_score.isinf(): #or min_separation_distance.isinf():
+        elif error_score.isinf() or min_separation_distance.isinf():
             combined_score = torch.tensor(0.0)
         #elif min_separation_distance <= 0.0:
             #combined_score = torch.tensor(0.0)
         else:
             # Use separation as multiplier
-            combined_score = error_score #* min_separation_distance  
+            combined_score = error_score * min_separation_distance  
         # else:
         #         combined_score = torch.tensor(0.0)
         

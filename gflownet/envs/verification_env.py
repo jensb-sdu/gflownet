@@ -14,27 +14,261 @@ def PAD_FUNC(**kwargs):
 
 # Example of custom functions
 def Yin(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the first element of the time series"""
     return input[0]
 
 def Yout(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the last element of the time series"""
     return input[-1]
 
+# Statistical Measures
+def median(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the median value"""
+    return torch.median(input)
 
-# list of ucntion to chose from
-FUNCTIONS = tuple(
-    [torch.mean,
-     torch.max,
-     torch.min,
-     Yin,
-     Yout,
-     torch.trapezoid,
-     torch.argmin,
-     torch.argmax,
+def std(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the standard deviation"""
+    return torch.std(input)
 
-     ]
-)
+def variance(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the variance"""
+    return torch.var(input)
+
+def mad(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the Mean Absolute Deviation"""
+    return torch.mean(torch.abs(input - torch.mean(input)))
+
+def rms(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the Root Mean Square"""
+    return torch.sqrt(torch.mean(input ** 2))
+
+def skewness(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the skewness (third moment)"""
+    mean = torch.mean(input)
+    std = torch.std(input)
+    return torch.mean(((input - mean) / std) ** 3)
+
+def kurtosis(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the kurtosis (fourth moment)"""
+    mean = torch.mean(input)
+    std = torch.std(input)
+    return torch.mean(((input - mean) / std) ** 4)
+
+# Range and Spread Measures
+def value_range(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the range (max - min)"""
+    return torch.max(input) - torch.min(input)
+
+def iqr(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the Interquartile Range (Q3 - Q1) - vmap compatible"""
+    sorted_input = torch.sort(input)[0]
+    n = len(sorted_input)
+    q1_idx = int(n * 0.25)
+    q3_idx = int(n * 0.75)
+    return sorted_input[q3_idx] - sorted_input[q1_idx]
+
+def percentile_90(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the 90th percentile - vmap compatible"""
+    sorted_input = torch.sort(input)[0]
+    idx = int(len(sorted_input) * 0.90)
+    return sorted_input[min(idx, len(sorted_input) - 1)]
+
+def percentile_10(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the 10th percentile - vmap compatible"""
+    sorted_input = torch.sort(input)[0]
+    idx = int(len(sorted_input) * 0.10)
+    return sorted_input[idx]
+
+def median(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the median value - vmap compatible"""
+    sorted_input = torch.sort(input)[0]
+    n = len(sorted_input)
+    if n % 2 == 1:
+        return sorted_input[n // 2]
+    else:
+        return (sorted_input[n // 2 - 1] + sorted_input[n // 2]) / 2
+
+# More efficient versions using kthvalue (which is vmap compatible)
+def iqr_fast(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the Interquartile Range (Q3 - Q1) - faster vmap compatible version"""
+    n = len(input)
+    q1_idx = max(1, int(n * 0.25))
+    q3_idx = max(1, int(n * 0.75))
+    q1 = torch.kthvalue(input, q1_idx)[0]
+    q3 = torch.kthvalue(input, q3_idx)[0]
+    return q3 - q1
+
+def percentile_90_fast(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the 90th percentile - faster vmap compatible version"""
+    n = len(input)
+    idx = max(1, min(n, int(n * 0.90)))
+    return torch.kthvalue(input, idx)[0]
+
+def percentile_10_fast(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the 10th percentile - faster vmap compatible version"""
+    n = len(input)
+    idx = max(1, int(n * 0.10))
+    return torch.kthvalue(input, idx)[0]
+
+def median_fast(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the median value - faster vmap compatible version"""
+    n = len(input)
+    k = (n + 1) // 2
+    return torch.kthvalue(input, k)[0]
+
+# Trend and Change Measures
+def slope(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the linear trend slope"""
+    n = len(input)
+    x = torch.arange(n, dtype=input.dtype, device=input.device)
+    x_mean = x.mean()
+    y_mean = input.mean()
+    numerator = torch.sum((x - x_mean) * (input - y_mean))
+    denominator = torch.sum((x - x_mean) ** 2)
+    return numerator / (denominator + 1e-10)
+
+def absolute_change(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the absolute change (last - first)"""
+    return input[-1] - input[0]
+
+def relative_change(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the relative change ((last - first) / first)"""
+    return (input[-1] - input[0]) / (torch.abs(input[0]) + 1e-10)
+
+def mean_absolute_change(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the mean absolute difference between consecutive values"""
+    return torch.mean(torch.abs(torch.diff(input)))
+
+def mean_change(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the mean difference between consecutive values"""
+    return torch.mean(torch.diff(input))
+
+# Energy and Power Measures
+def energy(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the sum of squared values"""
+    return torch.sum(input ** 2)
+
+def absolute_energy(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the sum of absolute values"""
+    return torch.sum(torch.abs(input))
+
+def mean_abs_value(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the mean of absolute values"""
+    return torch.mean(torch.abs(input))
+
+# Zero Crossing and Peak Measures
+def zero_crossing_rate(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the rate of sign changes"""
+    signs = torch.sign(input)
+    sign_changes = torch.sum(torch.abs(torch.diff(signs))) / 2
+    return sign_changes / (len(input) - 1)
+
+def mean_crossing_rate(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the rate of mean crossing"""
+    mean_val = torch.mean(input)
+    crossings = torch.sum(torch.abs(torch.diff(torch.sign(input - mean_val)))) / 2
+    return crossings / (len(input) - 1)
+
+def peaks_count(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the number of local maxima"""
+    if len(input) < 3:
+        return torch.tensor(0.0)
+    peaks = ((input[1:-1] > input[:-2]) & (input[1:-1] > input[2:])).sum()
+    return peaks.float()
+
+# Complexity Measures
+def abs_sum_of_changes(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the absolute sum of consecutive changes"""
+    return torch.sum(torch.abs(torch.diff(input)))
+
+def longest_strike_above_mean(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the length of the longest consecutive sequence above mean"""
+    mean_val = torch.mean(input)
+    mask = (input > mean_val).float()
+    
+    # Use cumulative sum with reset logic
+    # Create boundaries: 1 where streak starts, 0 elsewhere
+    boundaries = torch.cat([mask[:1], mask[1:] * (1 - mask[:-1])])
+    # Cumulative sum of boundaries gives group ID
+    groups = torch.cumsum(boundaries, dim=0)
+    # Cumulative count within each group
+    counts = torch.cumsum(mask, dim=0) - torch.maximum(
+        torch.zeros_like(groups),
+        torch.cumsum(boundaries * (torch.cumsum(mask, dim=0) - mask), dim=0)
+    )
+    
+    return torch.max(counts * mask)
+
+def longest_strike_below_mean(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the length of the longest consecutive sequence below mean"""
+    mean_val = torch.mean(input)
+    mask = (input < mean_val).float()
+    
+    boundaries = torch.cat([mask[:1], mask[1:] * (1 - mask[:-1])])
+    groups = torch.cumsum(boundaries, dim=0)
+    counts = torch.cumsum(mask, dim=0) - torch.maximum(
+        torch.zeros_like(groups),
+        torch.cumsum(boundaries * (torch.cumsum(mask, dim=0) - mask), dim=0)
+    )
+    
+    return torch.max(counts * mask)
+ 
 
 
+# Updated FUNCTIONS list with fast versions
+FUNCTIONS = tuple([
+    # Basic statistics
+    torch.mean,
+    torch.max,
+    torch.min,
+    median_fast,  # Use fast version
+    torch.std,
+    torch.var,
+    
+    # Positional
+    Yin,
+    Yout,
+    torch.argmin,
+    torch.argmax,
+    
+    # Distribution measures
+    mad,
+    rms,
+    skewness,
+    kurtosis,
+    
+    # Range measures (use fast versions)
+    value_range,
+    iqr_fast,
+    percentile_90_fast,
+    percentile_10_fast,
+    
+    # Integration
+    torch.trapezoid,
+    
+    # Trend measures
+    slope,
+    absolute_change,
+    relative_change,
+    mean_change,
+    mean_absolute_change,
+    
+    # Energy measures
+    energy,
+    absolute_energy,
+    mean_abs_value,
+    
+    # Crossing and peaks
+    zero_crossing_rate,
+    mean_crossing_rate,
+    peaks_count,
+    
+    # Complexity
+    abs_sum_of_changes,
+    longest_strike_above_mean,
+    longest_strike_below_mean,
+])
+ 
 
 
 class VerificationEnv(GFlowNetEnv) :
