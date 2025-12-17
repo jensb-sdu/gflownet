@@ -618,7 +618,7 @@ class GFlowNetAgent:
             # Update environments with sampled actions
             envs, actions, valids = self.step(envs, actions)
             # Add to batch
-            actions_torch = torch.tensor(actions)
+            #actions_torch = torch.tensor(actions)
             batch_forward.add_to_batch(
                 envs, actions, logprobs, logprobs_rev, valids, train=train
             )

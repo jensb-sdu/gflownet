@@ -1,0 +1,12 @@
+defaults:
+  - base
+
+_target_: gflownet.envs.verification_env.VerificationEnv
+
+id: verification
+
+
+data_path: "/home/dmd_user/Desktop/ECAA/gflownet/assembly_case/MP 2 Development dataset 1.3/Data/NPF14/NPF14/Test/White MM & White CH"
+window_size: 128
+max_length: 8
+min_function_width: 4
