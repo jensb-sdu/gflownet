@@ -4,7 +4,8 @@ from gflownet.utils.verification_utils import ForceDataset, ForceDisplacementDat
 from gflownet.proxy.base import Proxy
 from gflownet.utils.common import tfloat
 
-from scipy.spatial import ConvexHull
+from sklearn.cluster import DBSCAN
+
 import numpy as np
 
 class VerificationProxy(Proxy) :
@@ -22,6 +23,7 @@ class VerificationProxy(Proxy) :
         self.production_data = production_data
         self.alpha = alpha
         self.beta = beta
+        self.scoring_function = DBSCAN_grouping_and_separation
         
     
     def setup(self, env: VerificationEnv = None):
@@ -66,7 +68,7 @@ class VerificationProxy(Proxy) :
     def __call__(self, states):
 
 
-        rewards = torch.clamp(reward_function(self.apply_functions(states), self.labels, alpha=self.alpha, beta = self.beta), min=self.reward_min)
+        rewards = torch.clamp(self.get_score_by_group(self.apply_functions(states), self.labels, alpha=self.alpha, beta = self.beta), min=self.reward_min)
         output = tfloat(rewards, device = self.device, float_type = self.float)
         
         return output 
@@ -153,50 +155,50 @@ class VerificationProxy(Proxy) :
  
 
 
-def reward_function(grouped_data,
-                    labels, 
-                    alpha=1.0, 
-                    beta=1.0):
-    """
-    Apply score_grouping_and_separation to multiple groups of binary labelled points.
-    
-    Args:
-        grouped_data: torch.Tensor of shape [num_groups, num_points_per_group, n_dims + 1]
-                     Last dimension contains binary labels (0/1)
-        alpha: weight for tightness score
-        beta: weight for separation score
-    
-    Returns:
-        aggregate_score or (aggregate_score, individual_scores) if return_individual=True
-    """
-    
-    num_groups = grouped_data.shape[0]
-    individual_scores = []
-    valid_groups = []
-    
-    for group_idx in range(num_groups):
-        group_data = torch.transpose(grouped_data[group_idx], 0,1)  
+    def get_score_by_group(self, grouped_data,
+                        labels, 
+                        alpha=1.0, 
+                        beta=1.0):
+        """
+        Apply score_grouping_and_separation to multiple groups of binary labelled points.
         
-        try:
-            score = score_knn_grouping_and_separation(
-                coordinates=group_data,
-                labels=labels, 
-                alpha=alpha, 
-                beta=beta
-            )
-            individual_scores.append(score)
-            valid_groups.append(group_idx)
+        Args:
+            grouped_data: torch.Tensor of shape [num_groups, num_points_per_group, n_dims + 1]
+                        Last dimension contains binary labels (0/1)
+            alpha: weight for tightness score
+            beta: weight for separation score
+        
+        Returns:
+            aggregate_score or (aggregate_score, individual_scores) if return_individual=True
+        """
+        
+        num_groups = grouped_data.shape[0]
+        individual_scores = []
+        valid_groups = []
+        
+        for group_idx in range(num_groups):
+            group_data = torch.transpose(grouped_data[group_idx], 0,1)  
             
-        except ValueError as e:
-            print(f"Warning: Group {group_idx} skipped - {str(e)}")
-            continue
-    
-    if not individual_scores:
-        raise ValueError("No valid groups found for scoring")
-    
-    individual_scores = torch.tensor(individual_scores)
+            try:
+                score = self.scoring_function(
+                    coordinates=group_data,
+                    labels=labels, 
+                    alpha=alpha, 
+                    beta=beta
+                )
+                individual_scores.append(score)
+                valid_groups.append(group_idx)
+                
+            except ValueError as e:
+                print(f"Warning: Group {group_idx} skipped - {str(e)}")
+                continue
+        
+        if not individual_scores:
+            raise ValueError("No valid groups found for scoring")
+        
+        individual_scores = torch.tensor(individual_scores)
 
-    return individual_scores    
+        return individual_scores    
 
 
 def rank_normalize(data):
@@ -255,6 +257,56 @@ def IQR_normalize(data):
     normalized = (data - median) / iqr
 
     return normalized
+
+
+def f1_score(coordinates: torch.TensorType, 
+             labels, 
+             k=5):
+    """
+    Compute F1 score using k-NN classification based on average distance to k nearest label
+    
+    Args:
+        coordinates: torch.Tensor of shape [N, n] with point coordinates
+        labels: torch.Tensor of shape [N] with binary labels (0 or 1)
+        k: number of nearest neighbors to consider 
+    
+    Returns:
+        f1_score: float tensor with F1 score
+    """
+
+    label_1_mask = labels == 1
+
+    # Compute pairwise distances from all points to label 1 points
+    distances_to_label_1 = torch.cdist(coordinates, coordinates[label_1_mask], p=2)  # [N, N1]
+    
+    # Find k nearest label 1 neighbors for each point
+    k_nearest_distances, _ = torch.topk(distances_to_label_1, k= k, 
+                                    largest=False, dim=1)  # [N, k]
+    
+    # Average distance to k nearest label 1 points
+    avg_distance_to_label_1 = k_nearest_distances.mean(dim=1)  # [N]
+    
+    # Compute threshold as the maximum average distance among label 1 points
+    # This ensures all label 1 points are "inside" by definition
+    threshold = avg_distance_to_label_1[label_1_mask].max()
+    
+    # Add small margin to avoid numerical issues
+    threshold = threshold * 1.05
+    
+    # Predict labels: points within threshold are predicted as label 1
+    predicted_labels = (avg_distance_to_label_1 <= threshold).long()
+    
+    # Calculate false positives and false negatives
+    false_positives = ((predicted_labels == 1) & (labels == 0)).sum().float()
+    false_negatives = ((predicted_labels == 0) & (labels == 1)).sum().float()
+    true_positives = ((predicted_labels == 1) & (labels == 1)).sum().float()
+
+
+    precision = true_positives / (true_positives + false_positives + 1e-8)
+    recall = true_positives / (true_positives + false_negatives + 1e-8)
+    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+    return f1
+
 
 def score_grouping_and_separation(coordinates: torch.TensorType, 
                                 labels, 
@@ -384,54 +436,9 @@ def score_knn_grouping_and_separation(coordinates: torch.TensorType,
         return torch.tensor(0.0)
     
     try:
-        # Compute pairwise distances from all points to label 1 points
-        distances_to_label_1 = torch.cdist(coordinates, label_1_points, p=2)  # [N, N1]
-        
-        # Find k nearest label 1 neighbors for each point
-        k_nearest_distances, _ = torch.topk(distances_to_label_1, k_actual, 
-                                           largest=False, dim=1)  # [N, k]
-        
-        # Average distance to k nearest label 1 points
-        avg_distance_to_label_1 = k_nearest_distances.mean(dim=1)  # [N]
-        
-        # Compute threshold as the maximum average distance among label 1 points
-        # This ensures all label 1 points are "inside" by definition
-        threshold = avg_distance_to_label_1[label_1_mask].max()
-        
-        # Add small margin to avoid numerical issues
-        threshold = threshold * 1.05
-        
-        # Predict labels: points within threshold are predicted as label 1
-        predicted_labels = (avg_distance_to_label_1 <= threshold).long()
-        
-        # Calculate false positives and false negatives
-        false_positives = ((predicted_labels == 1) & (labels == 0)).sum().float()
-        false_negatives = ((predicted_labels == 0) & (labels == 1)).sum().float()
-        true_positives = ((predicted_labels == 1) & (labels == 1)).sum().float()
-        #true_negatives = ((predicted_labels == 0) & (labels == 0)).sum().float()
+        # Compute F1 score using k-NN
+        f1 = f1_score(coordinates, labels, k=k_actual)
 
-
-
-        # # # Total number of each class
-        # n_label_0 = label_0_mask.sum().float()
-        # n_label_1_total = label_1_mask.sum().float()
-        
-        # # # Calculate FP and FN rates
-        # fp_rate = false_positives / n_label_0 if n_label_0 > 0 else torch.tensor(0.0)
-        # fn_rate = false_negatives / n_label_1_total if n_label_1_total > 0 else torch.tensor(0.0)
-        
-        precision = true_positives / (true_positives + false_positives)
-        recall = true_positives / (true_positives + false_negatives)
-
-
-        # Return 0 score if max tolerated rates are exceeded
-        # if fn_rate <= fn_rate_max and fp_rate <= fp_rate_max :
-        # Classification accuracy component (1 - weighted error rate)
-        # error_score = 1.0 - (alpha * fp_rate + beta * fn_rate) / (alpha + beta)
-
-        error_score = 100 * 2*(precision * recall) / (recall + precision) if recall + precision > 1e-8 else 0.0
-        # error_score = torch.clamp(error_score, min=0.0, max=1.0)
-        
         # # Normalize dimensions to estiamte "seperability"
         coordinates_normalized = IQR_normalize(coordinates)
         
@@ -444,15 +451,15 @@ def score_knn_grouping_and_separation(coordinates: torch.TensorType,
         min_separation_distance = distances_between_classes.min()
         
         # Check for invalid values
-        if error_score.isnan() or min_separation_distance.isnan():
+        if f1.isnan() or min_separation_distance.isnan():
             combined_score = torch.tensor(0.0) 
-        elif error_score.isinf() or min_separation_distance.isinf():
+        elif f1.isinf() or min_separation_distance.isinf():
             combined_score = torch.tensor(0.0)
         #elif min_separation_distance <= 0.0:
             #combined_score = torch.tensor(0.0)
         else:
             # Use separation as multiplier
-            combined_score = error_score * min_separation_distance  
+            combined_score = f1 * min_separation_distance  
         # else:
         #         combined_score = torch.tensor(0.0)
         
@@ -462,3 +469,124 @@ def score_knn_grouping_and_separation(coordinates: torch.TensorType,
         print(f"Warning: k-NN computation failed: {e}")
         raise e
         #return torch.tensor(0.0)
+
+
+
+def score_dist_over_1_minus_f1(coordinates: torch.TensorType,
+                                labels,
+                                alpha=1.0,
+                                beta=1.0):
+    """
+    Score based on minimum separation distance divided by (1 - F1 score).
+    
+    Args:
+        coordinates: torch.Tensor of shape [N, n] with point coordinates
+        labels: torch.Tensor of shape [N] with binary labels (0 or 1)
+        alpha: dummy parameter for compatibility
+        beta: dummy parameter for compatibility
+        
+    Returns:
+        Combined score defined as score = min_separation_distance / (1 - F1 score) (higher is better)
+    """
+    normalized_coords = IQR_normalize(coordinates)
+
+    f1 = f1_score(normalized_coords, labels, k=5)
+
+
+    distances_between_classes = torch.cdist(normalized_coords[labels == 1], normalized_coords[labels == 0], p=2)
+
+    # Find minimum separation distance
+    min_separation_distance = distances_between_classes.abs().min()
+
+
+
+
+    combined_score = min_separation_distance / (1.0 - f1 + 1e-8)
+
+    # clamp to avoid extreme values
+    combined_score = torch.clamp(combined_score, min=0.0, max=1e6)
+
+
+    return combined_score
+
+
+
+
+def DBSCAN_grouping_and_separation(coordinates: torch.TensorType,
+                                labels,
+                                eps=0.5,
+                                min_samples=5,
+                                alpha=1.0,
+                                beta=1.0):
+    """
+    Score based on DBSCAN clustering to identify tight groups and their separation.
+    For each identified cluster calculate F1 score based on labels and combine based on number of points.
+    
+    Args:
+        coordinates: torch.Tensor of shape [N, n] with point coordinates
+        labels: torch.Tensor of shape [N] with binary labels (0 or 1)
+        eps: DBSCAN eps parameter
+        min_samples: DBSCAN min_samples parameter
+        alpha: weight for tightness score
+        beta: weight for separation score
+
+    Returns:
+        Combined score defined as score = tightness_score * alpha + separation_score * beta (higher is better)
+    """
+    # Apply DBSCAN clustering
+    dbscan = DBSCAN(eps=eps, min_samples=min_samples)
+    cluster_labels = dbscan.fit_predict(coordinates.detach().cpu().numpy())
+
+    # TODO: Incorporate tightness and separation calculations into combined score
+    # # Compute tightness score (intra-cluster distance)
+    # tightness_score = 0.0
+    # for cluster_id in set(cluster_labels):
+    #     if cluster_id == -1:
+    #         continue  # Skip noise points
+    #     cluster_points = coordinates[cluster_labels == cluster_id]
+    #     if len(cluster_points) > 1:
+    #         tightness_score += 1.0 / (1.0 + torch.mean(torch.pdist(cluster_points)))
+
+    # # Compute separation score (inter-cluster distance)
+    # separation_score = 0.0
+    # for cluster_id_1 in set(cluster_labels):
+    #     for cluster_id_2 in set(cluster_labels):
+    #         if cluster_id_1 >= cluster_id_2:
+    #             continue  # Avoid duplicate pairs
+    #         cluster_points_1 = coordinates[cluster_labels == cluster_id_1]
+    #         cluster_points_2 = coordinates[cluster_labels == cluster_id_2]
+    #         if len(cluster_points_1) > 0 and len(cluster_points_2) > 0:
+    #             separation_score += torch.mean(torch.cdist(cluster_points_1, cluster_points_2, p=2))
+
+
+    # Find FP and FN based on cluster assignments
+
+    score = 0.0
+    N = labels.sum().item()
+    
+    for cluster_id in set(cluster_labels):
+        if cluster_id == -1:
+            continue  # Skip noise points
+        cluster_mask = (cluster_labels == cluster_id)
+        cluster_labels_in_data = labels[cluster_mask]
+        # Assign predicted label as majority label in cluster
+        if cluster_labels_in_data.sum().item() >= (len(cluster_labels_in_data) / 2):
+            false_positives = (cluster_labels_in_data == 0).sum().float()
+            false_negatives = 0.0
+            true_positives = (cluster_labels_in_data == 1).sum().float()
+        else:
+            true_positives = 0.0
+            false_positives = 0.0
+            false_negatives = (cluster_labels_in_data == 1).sum().float()
+
+        # Calculate false positives and false negatives for this cluster
+        precision = true_positives / (true_positives + false_positives + 1e-8)
+        recall = true_positives / (true_positives + false_negatives + 1e-8)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+
+        # F1_i * N_i / N_total 
+        score += f1.item() * cluster_mask.sum().item() / N
+
+    # Clamp score to avoid extreme values
+    #score = torch.clamp(torch.tensor(score), min=0.0, max=1e6)
+    return score

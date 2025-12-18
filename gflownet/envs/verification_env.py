@@ -365,6 +365,14 @@ class VerificationEnv(GFlowNetEnv) :
         valid_ends = ends_grid[mask].to(torch.int16)
         pairs_per_function = valid_starts.numel()
 
+        try:
+            # Check that the last and first valid pairs are correct
+            assert valid_starts[0].item() == 0
+            assert valid_ends[-1].item() == W - 1
+        except AssertionError:
+            raise ValueError(f"Error in action space construction: invalid start/end pairs {valid_starts, valid_ends}")
+
+
         # replicate for all functions
         if self.n_functions == 1:
             func_col = torch.ones(pairs_per_function, dtype=torch.int16, device="cpu")
