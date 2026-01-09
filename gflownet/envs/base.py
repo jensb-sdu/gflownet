@@ -70,7 +70,7 @@ class GFlowNetEnv:
         self._action2index = {a: idx for idx, a in enumerate(self.action_space)}
         self.action_space_torch = torch.tensor(
             self.action_space, device=self.device, dtype=self.float
-        )
+        ) if not torch.is_tensor(self.action_space) else self.action_space # Convert to tensor if not already else pass pointer
         # Mask dimensionality
         self._mask_dim = self._compute_mask_dim()
         # Max trajectory length

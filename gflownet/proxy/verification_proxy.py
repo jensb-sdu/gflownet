@@ -4,14 +4,14 @@ from gflownet.utils.verification_utils import ForceDataset, ForceDisplacementDat
 from gflownet.proxy.base import Proxy
 from gflownet.utils.common import tfloat
 
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import DBSCAN, HDBSCAN
 
 import numpy as np
 
 class VerificationProxy(Proxy) :
     def __init__(self,
         production_data = True,
-        reward_min: float = 1.0,
+        reward_min: float = 0.01,
         do_clip_rewards: bool = False,
         alpha = 1,
         beta = 1,
@@ -23,8 +23,22 @@ class VerificationProxy(Proxy) :
         self.production_data = production_data
         self.alpha = alpha
         self.beta = beta
-        self.scoring_function = DBSCAN_grouping_and_separation
+        self.scoring_function = HDBSCAN_clustering_PCA
+
+        self.min_f1_score = 0.95  # Minimum acceptable F1 score for verification
+
+        self.A = 100
+        self.B = 0
+        self.Q = 100 * self.min_f1_score
+        self.P = self.Q + (self.A-self.Q)/2
+        self.K = (self.A -self.Q) / (self.Q-self.B) ** (1/(self.P-self.Q))
+
+    
         
+
+
+
+
     
     def setup(self, env: VerificationEnv = None):
         """
@@ -186,6 +200,9 @@ class VerificationProxy(Proxy) :
                     alpha=alpha, 
                     beta=beta
                 )
+                # Soft plus to avoid zero scores
+                score = torch.log1p(torch.exp(score - self.min_f1_score))
+
                 individual_scores.append(score)
                 valid_groups.append(group_idx)
                 
@@ -470,7 +487,18 @@ def score_knn_grouping_and_separation(coordinates: torch.TensorType,
         raise e
         #return torch.tensor(0.0)
 
+def identify_zero_dimension(coordinates: torch.TensorType):
+    """
+    Identify uninformative dimensions that could be removed or explained using a single dimension.
+    Args:
+        coordinates: torch.Tensor of shape [N, n] with point coordinates
+    Returns:
+        zero_dim_indices: list of dimension indices with near-zero variance
 
+    """
+    u, s, v = torch.pca_lowrank(coordinates, q=coordinates.shape[1])
+    zero_dim_indices = (s < 1).nonzero(as_tuple=True)[0].tolist()
+    return zero_dim_indices
 
 def score_dist_over_1_minus_f1(coordinates: torch.TensorType,
                                 labels,
@@ -509,12 +537,88 @@ def score_dist_over_1_minus_f1(coordinates: torch.TensorType,
 
     return combined_score
 
+def clustered_f1_score(labels,
+                         cluster_labels,
+                         predicted_labels):
+    """
+    Compute weighted F1 score based on DBSCAN cluster assignments.
+    Args:
+        coordinates: torch.Tensor of shape [N, n] with point coordinates
+        labels: torch.Tensor of shape [N] with binary true labels (0 or 1)
+        cluster_labels: array-like of shape [N] with cluster assignments from DBSCAN
+        predicted_labels: torch.Tensor of shape [num_clusters] with predicted labels for each cluster
+    Returns:
+        total_f1: float tensor with weighted F1 score across clusters
+        num_clusters: int with number of clusters considered
+    """
+
+    f1_total = torch.tensor(0.0, device=labels.device)
+    N = labels.sum()
+
+    clusters = torch.unique(cluster_labels)
+    for cluster_id in clusters:
+        if cluster_id == -1:
+            continue  # Skip noise points
+
+        # Get cluster label from predicted labels
+        predicted_label = predicted_labels[cluster_id]
+
+        cluster_mask = (cluster_labels == cluster_id)
+        cluster_labels_in_data = labels[cluster_mask]
+       
+
+        # Calculate true positives, false positives, false negatives
+        true_positives = ((predicted_label == 1) & (cluster_labels_in_data == 1)).sum().float()
+        false_positives = ((predicted_label == 1) & (cluster_labels_in_data == 0)).sum().float()
+        false_negatives = ((predicted_label == 0) & (cluster_labels_in_data == 1)).sum().float()
 
 
+        # Calculate false positives and false negatives for this cluster
+        precision = true_positives / (true_positives + false_positives + 1e-8)
+        recall = true_positives / (true_positives + false_negatives + 1e-8)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
 
-def DBSCAN_grouping_and_separation(coordinates: torch.TensorType,
+        # F1_i * N_i / N_total 
+        N_i = cluster_mask.sum().item()
+        f1_total += f1 * N_i / N
+
+    return f1_total
+
+def get_unique_cluster_predictions(cluster_labels, labels):
+    """
+    Assign predicted label to each cluster based on majority vote.
+    
+    Args:
+        cluster_labels: array-like of shape [N] with cluster assignments from DBSCAN
+        labels: torch.Tensor of shape [N] with binary true labels (0 or 1)
+        
+    Returns:
+        predicted_labels: torch.Tensor of shape [N] with predicted labels based on cluster majority
+    """
+    
+    unique_labels = torch.unique(cluster_labels)
+
+    # Default predicted label to 0
+    predicted_labels = torch.zeros_like(unique_labels)
+
+    for cluster_id in unique_labels:
+        if cluster_id == -1:
+            continue  # Skip noise points
+        cluster_mask = (cluster_labels == cluster_id)
+        cluster_labels_in_data = labels[cluster_mask]
+        # Assign predicted label as majority label in cluster
+        num_label_1 = cluster_labels_in_data.sum().item()
+        num_label_0 = cluster_labels_in_data.shape[0] - num_label_1
+        # Update predicted label for this cluster if majority is label 1
+        if num_label_1 >= num_label_0:
+            predicted_labels[cluster_id] = 1
+
+    
+    return predicted_labels
+
+def DBSCAN_clustering_PCA(coordinates: torch.TensorType,
                                 labels,
-                                eps=0.5,
+                                eps=0.1,
                                 min_samples=5,
                                 alpha=1.0,
                                 beta=1.0):
@@ -531,11 +635,15 @@ def DBSCAN_grouping_and_separation(coordinates: torch.TensorType,
         beta: weight for separation score
 
     Returns:
-        Combined score defined as score = tightness_score * alpha + separation_score * beta (higher is better)
+        Combined score defined as score = F1 * alpha + separation_score * beta (higher is better)
     """
     # Apply DBSCAN clustering
     dbscan = DBSCAN(eps=eps, min_samples=min_samples)
-    cluster_labels = dbscan.fit_predict(coordinates.detach().cpu().numpy())
+    normalized_coords = IQR_normalize(coordinates)
+
+    cluster_labels = torch.tensor(dbscan.fit_predict(normalized_coords.detach().cpu().numpy()), device=coordinates.device)
+
+    predicted_labels = get_unique_cluster_predictions(cluster_labels, labels)
 
     # TODO: Incorporate tightness and separation calculations into combined score
     # # Compute tightness score (intra-cluster distance)
@@ -547,46 +655,66 @@ def DBSCAN_grouping_and_separation(coordinates: torch.TensorType,
     #     if len(cluster_points) > 1:
     #         tightness_score += 1.0 / (1.0 + torch.mean(torch.pdist(cluster_points)))
 
-    # # Compute separation score (inter-cluster distance)
-    # separation_score = 0.0
-    # for cluster_id_1 in set(cluster_labels):
-    #     for cluster_id_2 in set(cluster_labels):
-    #         if cluster_id_1 >= cluster_id_2:
-    #             continue  # Avoid duplicate pairs
-    #         cluster_points_1 = coordinates[cluster_labels == cluster_id_1]
-    #         cluster_points_2 = coordinates[cluster_labels == cluster_id_2]
-    #         if len(cluster_points_1) > 0 and len(cluster_points_2) > 0:
-    #             separation_score += torch.mean(torch.cdist(cluster_points_1, cluster_points_2, p=2))
+
+    # Find FP and FN based on cluster assignments
+
+    f1_total = clustered_f1_score(labels, cluster_labels, predicted_labels)
+
+
+    zero_dims = identify_zero_dimension(coordinates)
+    
+    score = f1_total / (1 + len(zero_dims))
+
+    return score
+
+
+
+def HDBSCAN_clustering_PCA(coordinates: torch.TensorType,
+                                labels,
+                                min_cluster_size=5,
+                                alpha=1.0,
+                                beta=1.0):
+    """
+    Score based on HDBSCAN clustering to identify tight groups and their separation.
+    For each identified cluster calculate F1 score based on labels and combine based on number of points.
+    
+    Args:
+        coordinates: torch.Tensor of shape [N, n] with point coordinates
+        labels: torch.Tensor of shape [N] with binary labels (0 or 1)
+        min_cluster_size: HDBSCAN min_cluster_size parameter
+        alpha: weight for tightness score
+        beta: weight for separation score
+
+    Returns:
+        score: weighted F1 score adjusted for uninformative dimensions (higher is better)
+    """
+    # Apply HDBSCAN clustering
+    hdbscan = HDBSCAN(min_cluster_size=min_cluster_size)
+    normalized_coords = IQR_normalize(coordinates)
+
+    cluster_labels = torch.tensor(hdbscan.fit_predict(normalized_coords.detach().cpu().numpy()), device=coordinates.device)
+
+    predicted_labels = get_unique_cluster_predictions(cluster_labels, labels)
+
+    # TODO: Incorporate tightness and separation calculations into combined score
+    # # Compute tightness score (intra-cluster distance)
+    # tightness_score = 0.0
+    # for cluster_id in set(cluster_labels):
+    #     if cluster_id == -1:
+    #         continue  # Skip noise points
+    #     cluster_points = coordinates[cluster_labels == cluster_id]
+    #     if len(cluster_points) > 1:
+    #         tightness_score += 1.0 / (1.0 + torch.mean(torch.pdist(cluster_points)))
 
 
     # Find FP and FN based on cluster assignments
 
-    score = 0.0
-    N = labels.sum().item()
-    
-    for cluster_id in set(cluster_labels):
-        if cluster_id == -1:
-            continue  # Skip noise points
-        cluster_mask = (cluster_labels == cluster_id)
-        cluster_labels_in_data = labels[cluster_mask]
-        # Assign predicted label as majority label in cluster
-        if cluster_labels_in_data.sum().item() >= (len(cluster_labels_in_data) / 2):
-            false_positives = (cluster_labels_in_data == 0).sum().float()
-            false_negatives = 0.0
-            true_positives = (cluster_labels_in_data == 1).sum().float()
-        else:
-            true_positives = 0.0
-            false_positives = 0.0
-            false_negatives = (cluster_labels_in_data == 1).sum().float()
+    f1_total = clustered_f1_score(labels, cluster_labels, predicted_labels)
 
-        # Calculate false positives and false negatives for this cluster
-        precision = true_positives / (true_positives + false_positives + 1e-8)
-        recall = true_positives / (true_positives + false_negatives + 1e-8)
-        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
 
-        # F1_i * N_i / N_total 
-        score += f1.item() * cluster_mask.sum().item() / N
+    zero_dims = identify_zero_dimension(coordinates)
 
-    # Clamp score to avoid extreme values
-    #score = torch.clamp(torch.tensor(score), min=0.0, max=1e6)
+    score = f1_total / (1 + len(zero_dims))
+
     return score
+

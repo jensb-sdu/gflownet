@@ -259,7 +259,7 @@ FUNCTIONS = tuple([
     mean_abs_value,
     
     # Crossing and peaks
-    zero_crossing_rate,
+    #zero_crossing_rate,
     mean_crossing_rate,
     peaks_count,
     
