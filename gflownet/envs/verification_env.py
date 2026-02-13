@@ -176,6 +176,23 @@ def peaks_count(input: TensorType, *, dtype: torch.dtype | None = None):
     peaks = ((input[1:-1] > input[:-2]) & (input[1:-1] > input[2:])).sum()
     return peaks.float()
 
+def valleys_count(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the number of local minima"""
+    if len(input) < 3:
+        return torch.tensor(0.0)
+    valleys = ((input[1:-1] < input[:-2]) & (input[1:-1] < input[2:])).sum()
+    return valleys.float()
+
+def extreme_points_count(input: TensorType, *, dtype: torch.dtype | None = None):
+    """Returns the number of local extrema (maxima + minima)"""
+    if len(input) < 3:
+        return torch.tensor(0.0)
+    peaks = (input[1:-1] > input[:-2]) & (input[1:-1] > input[2:])
+    valleys = (input[1:-1] < input[:-2]) & (input[1:-1] < input[2:])
+    extrema = peaks | valleys
+    return extrema.sum().float()
+
+
 # Complexity Measures
 def abs_sum_of_changes(input: TensorType, *, dtype: torch.dtype | None = None):
     """Returns the absolute sum of consecutive changes"""
@@ -262,6 +279,8 @@ FUNCTIONS = tuple([
     #zero_crossing_rate,
     mean_crossing_rate,
     peaks_count,
+    valleys_count,
+    extreme_points_count,
     
     # Complexity
     abs_sum_of_changes,
@@ -280,6 +299,7 @@ class VerificationEnv(GFlowNetEnv) :
                  data_path: Union[str, Path] = None,
                  max_length: int = 16,
                  window_size: int = 2048,
+                 resolution: int = None,
                  min_function_width = 64,
                  internal_dtype: torch.dtype = torch.int16,
                  **kwargs):
@@ -310,6 +330,7 @@ class VerificationEnv(GFlowNetEnv) :
         self.funcidx2token = { idx + 1 : func for idx, func in enumerate(self.functions) }
         
         self.window_size = window_size
+        self.resolution = resolution
         self.min_function_width = min_function_width
         self.action_space = None
 
@@ -334,28 +355,33 @@ class VerificationEnv(GFlowNetEnv) :
         if self.action_space is not None:
             return self.action_space.clone()
 
-        key = (self.n_functions, self.window_size, self.min_function_width)
+        if self.resolution is not None and self.resolution > 0:
+            W = int(self.resolution)
+        else:
+            W = int(self.window_size)
+
+        key = (self.n_functions, W, self.min_function_width)
 
         if key in VerificationEnv._action_space_cache:
             cached = VerificationEnv._action_space_cache[key]
             self.action_space = cached.to(self.device if self.device else "cpu")
             return self.action_space.clone()
 
-        W = int(self.window_size)
-        m = int(self.min_function_width)
+        
+        m = int(self.min_function_width) -1  # min width offset 
         u = W - m  # number of possible start positions
         if u <= 0:
             # no valid (start,end) pairs, only EOS
-            tensor_cpu = torch.tensor([[self.eos_idx, 0, 0]], dtype=torch.int16, device="cpu")
-            VerificationEnv._action_space_cache[key] = tensor_cpu
-            self.action_space = tensor_cpu.to(self.device if self.device else "cpu")
-            return self.action_space.clone()
+            action_tensor = torch.tensor([[self.eos_idx, 0, 0]], dtype=torch.int16, device=self.device if self.device else "cpu")
+            VerificationEnv._action_space_cache[key] = action_tensor.to("cpu")
+     
+            return action_tensor.clone()
 
         # Build grid for a single function on CPU
         # start indices: 0 .. u-1 (shape u x u after broadcast)
-        starts_grid = torch.arange(u, dtype=torch.int32, device="cpu").view(u, 1).expand(u, u)
+        starts_grid = torch.arange(u, dtype=torch.int32, device=self.device if self.device else "cpu").view(u, 1).expand(u, u)
         # relative offset for end: 0 .. u-1 (same shape u x u)
-        rel_offsets = torch.arange(u, dtype=torch.int32, device="cpu").view(1, u).expand(u, u)
+        rel_offsets = torch.arange(u, dtype=torch.int32, device=starts_grid.device).view(1, u).expand(u, u)
         # ends = start + min_width + rel_offsets
         ends_grid = starts_grid + m + rel_offsets
         # mask valid pairs (end must be < W)
@@ -374,24 +400,31 @@ class VerificationEnv(GFlowNetEnv) :
 
 
         # replicate for all functions
-        if self.n_functions == 1:
-            func_col = torch.ones(pairs_per_function, dtype=torch.int16, device="cpu")
+        F = self.n_functions
+        if F == 1:
+            # single function: keep original ordering (starts/ends)
+            func_col = torch.ones(pairs_per_function, dtype=torch.int16, device=starts_grid.device)
+            starts_all = valid_starts
+            ends_all = valid_ends
         else:
-            func_col = torch.arange(1, self.n_functions + 1, dtype=torch.int16, device="cpu").repeat_interleave(pairs_per_function)
+            # New ordering: for each valid (start,end) pair, list all functions
+            # i.e. [ (start0,end0,func1),(start0,end0,func2),...,(start1,end1,func1),... ]
+            # func_col should cycle fastest across functions -> arange(...).repeat(pairs_per_function)
+            func_col = torch.arange(1, F + 1, dtype=torch.int16, device=starts_grid.device).repeat(pairs_per_function)
+            # repeat each start/end value F times to align with func_col blocks
+            starts_all = valid_starts.repeat_interleave(F)
+            ends_all = valid_ends.repeat_interleave(F)
 
-        starts_all = valid_starts.repeat(self.n_functions)
-        ends_all = valid_ends.repeat(self.n_functions)
-
-        # stack columns [func, start, end]
-        actions = torch.stack([func_col, starts_all, ends_all], dim=1).to(torch.int16)
+        # stack columns [start, end, function]
+        actions = torch.stack([starts_all, ends_all, func_col], dim=1).to(torch.int16)
 
         # append EOS action (keep dtype int16; eos_idx is negative and fits)
-        eos_row = torch.tensor([[self.eos_idx, 0, 0]], dtype=torch.int16, device="cpu")
-        tensor_cpu = torch.cat([actions, eos_row], dim=0).contiguous()
+        eos_row = torch.tensor([[self.eos_idx, 0, 0]], dtype=torch.int16, device=starts_grid.device)
+        action_tensor = torch.cat([actions, eos_row], dim=0).contiguous()
 
         # cache CPU tensor and move a copy to instance device
-        VerificationEnv._action_space_cache[key] = tensor_cpu
-        self.action_space = tensor_cpu.to(self.device if self.device else "cpu")
+        VerificationEnv._action_space_cache[key] = action_tensor.to("cpu")
+        self.action_space = action_tensor
         return self.action_space
 
 
@@ -419,20 +452,25 @@ class VerificationEnv(GFlowNetEnv) :
         """
         state = self._get_state(state)
         done = self._get_done(done)
-        if done:
-            return torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
-        # If sequence is not at maximum length, all actions are valid
-        seq_len = self._get_seq_length(state)
-        if seq_len < self.max_length:
-            mask = torch.zeros(self.action_space_dim, dtype=torch.bool, device=self.device)
-            #filter out existing actions in the current state
-            mask[self.actions2indices(state[:seq_len])] = True          
+        if not done:  
+            # If sequence is not at maximum length, all actions are valid
+            seq_len = self._get_seq_length(state)
+            if seq_len < self.max_length:
+                mask = torch.zeros(self.action_space_dim, dtype=torch.bool, device=self.device)
+                #filter out existing actions in the current state
+                mask[self.actions2indices(state[:seq_len])] = True
+                # EOS is invalid until max length is reached
+                mask[self.eos_idx] = True
+                return mask
+            # If sequence is at maximum length, only EOS is valid
+            mask = torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
+            mask[self.eos_idx] = False
             return mask
 
-        # Otherwise, only EOS is valid
-        mask = torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
-        mask[self.eos_idx] = False
-        return mask
+        else:
+            return torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
+ 
+        
 
     def get_valid_actions(
         self,
@@ -461,8 +499,7 @@ class VerificationEnv(GFlowNetEnv) :
         state = self._get_state(state)
         done = self._get_done(done)
         mask = torch.ones(self.action_space_dim, dtype=torch.bool, device=self.device)
-        if done:
-            return mask
+        
         # If sequence is not at maximum length, all actions are valid
         if parents_a is None:
             _, parents_a = self.get_parents(state, done)
@@ -473,6 +510,10 @@ class VerificationEnv(GFlowNetEnv) :
             if not torch.is_tensor(pa):
                 pa = torch.tensor(pa, dtype=self.action_space.dtype, device=self.action_space.device)
             eq = (self.action_space == pa).all(dim=1)
+            if not eq.any():
+                raise ValueError(
+                    f"Parent action {pa} not found in action space."
+                )
             mask[eq.to(self.device)] = False
         return mask
 
@@ -611,7 +652,48 @@ class VerificationEnv(GFlowNetEnv) :
             self.state[self._get_seq_length()] = action
             return self.state, action, valid
     
-    
+
+    def step_backwards(
+            self, action: TensorType["action_dim"], skip_mask_check: bool = False
+        ) -> Tuple[TensorType["state_dim", "action_dim"], TensorType["action_dim"], bool]:
+            """
+            Executes backward step given an action.
+
+            Args
+            ----
+            action : TensorType["action_dim"]
+                Action to be executed. An action is a tuple int values indicating the
+                dimensions to decrement by 1.
+
+            Returns
+            -------
+            self.state : TensorType["state_dim", "action_dim"]
+                The sequence after executing the action
+
+            action : TensorType["action_dim"]
+                Action executed
+
+            valid : bool
+                False, if the action is not allowed for the current state.
+            """
+            # Generic pre-step checks
+            do_step, self.state, action = self._pre_step(action, True, skip_mask_check)
+            if not do_step:
+                return self.state, action, False
+            parents, parents_a = self.get_parents()
+            
+            # Ensure action and parents_a are equal
+            if torch.equal(action, parents_a[0]) is False:
+                raise ValueError(
+                    f"Tried to execute backward action {action} not leading to current state."
+                )
+           
+            state_next = parents[0]
+
+            self.set_state(state_next, done=False)
+            self.n_actions += 1
+            return self.state, action, True
+
     # def randomize_and_temper_sampling_distribution(
     #     self,
     #     policy_outputs: TensorType["n_states", "policy_output_dim"],
@@ -783,9 +865,9 @@ class VerificationEnv(GFlowNetEnv) :
         for r in rows:
             # Expect each row to be [func_idx, start, end]
             try:
-                func_idx = int(r[0])
-                start = int(r[1])
-                end = int(r[2])
+                func_idx = int(r[2])
+                start = int(r[0])
+                end = int(r[1])
             except Exception:
                 # Fallback: skip malformed rows
                 continue
@@ -867,9 +949,9 @@ class VerificationEnv(GFlowNetEnv) :
                     func_idx = i
                     break
             if func_idx is not None:
-                state_list.append([func_idx, a, b])
+                state_list.append([a, b, func_idx])
         
-        state_tensor = torch.tensor([state_list], dtype=torch.int16, device=self.device)
+        state_tensor = torch.tensor(state_list, dtype=torch.int16, device=self.device)
 
         return state_tensor
 
@@ -932,9 +1014,13 @@ class VerificationEnv(GFlowNetEnv) :
         if self.equal(state, self.source):
             return 0
 
+        # Ensure state is a tensor
+        if not torch.is_tensor(state):
+            state = torch.tensor(state, dtype=self.int, device=self.device)
+
         # Extract the function-index column (handle 1D or 2D)
         if state.dim() > 1:
-            func_indices = state[:, 0]
+            func_indices = state[:, 2]
         else:
             func_indices = state
 

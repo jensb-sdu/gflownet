@@ -34,8 +34,12 @@ def main(config):
     # Initialize a GFlowNet agent from the configuration file
     gflownet = gflownet_from_config(config)
 
+    save_path = f"env_{gflownet.env.__class__.__name__}_proxy_{gflownet.proxy.__class__.__name__}_gfn"
+
     # Train GFlowNet
     gflownet.train()
+
+    
 
     # Sample from trained GFlowNet
     # TODO: move to method in GFlowNet agent, like sample_and_log()
@@ -52,9 +56,11 @@ def main(config):
         )
         samples_dir = Path("./samples/")
         samples_dir.mkdir(parents=True, exist_ok=True)
-        df.to_csv(samples_dir / "gfn_samples.csv")
+        csv_path = samples_dir /  (save_path + ".csv")
+        df.to_csv(csv_path)
         dct = {"x": x_sampled, "energy": energies}
-        pickle.dump(dct, open(samples_dir / "gfn_samples.pkl", "wb"))
+        pkl_path = samples_dir /  (save_path + ".pkl")
+        pickle.dump(dct, open(pkl_path, "wb"))
 
     # Print replay buffer
     if len(gflownet.buffer.replay) > 0:

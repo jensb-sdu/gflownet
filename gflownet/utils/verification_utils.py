@@ -21,10 +21,11 @@ from datetime import datetime
 
 
 class ForceDataset(Dataset):
-    def __init__(self, directory = None, transform=None, window_size = 1024, sim_data = False, filter = False):
+    def __init__(self, directory = None, transform=None, window_size = 1024,resolution = None):
         self.directory = directory
         self.transform = transform
         self.window_size = window_size
+        self.resolution = resolution
         self.labeled_forces = pd.DataFrame()  # Initialize an empty DataFrame
 
         if directory is not None:
@@ -114,7 +115,7 @@ class ForceDataset(Dataset):
 
         z_force = [force[2] for force in data]
 
-        z_force = preprocess_force(z_force, self.window_size)
+        z_force = preprocess_force(z_force, self.window_size, self.resolution)
         
 
         file_df = pd.DataFrame({'data':[torch.tensor(z_force.copy(), dtype=torch.float32)], 'label': label})
@@ -268,11 +269,19 @@ class ForceDisplacementDataset(ForceDataset):
     def process_file(self, file):
         file_path, label = file
         data = self.read_lines_until_empty(file_path)
-                    
+
+        if data.size == 0:
+            print(f"Warning: No data found in file {file_path}. Skipping.")
+            return pd.DataFrame()
+
         # Conversion from string to float
         load = np.array([float(data[j,2].replace(",",".")) for j in range(len(data))])
         disp = np.array([float(data[j,1].replace(",",".")) for j in range(len(data))])
         
+        # Check that load and disp exist and have the same length
+        if len(load) == 0 or len(disp) == 0 or len(load) != len(disp):
+            print(f"Warning: Invalid data in file {file_path}. Skipping.")
+            return pd.DataFrame()
 
         
         # Align on the x axis - set x=0 at first threshold crossing
@@ -285,7 +294,7 @@ class ForceDisplacementDataset(ForceDataset):
 
 
 
-        # Remove initial points goinfing backward (right to left)
+        # Remove initial points going backward (right to left)
         start_idx = 0
         for j in range(1, len(disp)):
             # Look for the point where displacement starts increasing consistently
@@ -301,8 +310,20 @@ class ForceDisplacementDataset(ForceDataset):
 
         # Window signal
         # Cut where disp less or equal to MinX
-        idx_leq = np.where(disp <= self.MinX)[0][-1]
-        idx_geq = np.where(disp >= self.MaxX)[0][0]
+        less_eq_indices = np.where(disp <= self.MinX)
+        if np.any(less_eq_indices[0]):
+            idx_leq = less_eq_indices[0][-1]
+        else:
+            idx_leq = 0
+        # Cut where disp greater or equal to MaxX
+        greater_eq_indices = np.where(disp >= self.MaxX)
+        if np.any(greater_eq_indices[0]):
+            idx_geq = greater_eq_indices[0][0]
+        else:
+            idx_geq = len(disp)
+        
+
+
         disp = disp[idx_leq:idx_geq]
         load = load[idx_leq:idx_geq]
 
@@ -316,7 +337,12 @@ class ForceDisplacementDataset(ForceDataset):
             disp_new = disp
 
 
+        #load = preprocess_force(load, self.window_size, cutoff_freq=25, sampling_rate=1125)
 
+        # Check if load is not empty after preprocessing
+        if len(load) == 0:
+            print(f"Warning: No valid load data after preprocessing in file {file_path}. Skipping.")
+            return pd.DataFrame()
 
         file_df = pd.DataFrame({'force':[torch.tensor(load.copy(), dtype=torch.float32)], 'displacement': [torch.tensor(disp_new.copy(), dtype=torch.float32)], 'label': int(label)})
 
@@ -567,11 +593,11 @@ def low_pass_filter(data, cutoff_freq, sampling_rate = 500.0):
 
 
 
-def preprocess_force(force, window_size):
+def preprocess_force(force, window_size, resolution, cutoff_freq=25.0, sampling_rate=500):
 
 
 
-    force = low_pass_filter(force, cutoff_freq=25.0, sampling_rate=500)
+    force = low_pass_filter(force, cutoff_freq=cutoff_freq, sampling_rate=sampling_rate)
     peaks = scipy.signal.find_peaks(-force, prominence = 4)[0]
     prominences = scipy.signal.peak_prominences(-force, peaks)[0]
     window_mid = 0
@@ -582,10 +608,19 @@ def preprocess_force(force, window_size):
         window_mid = force.argmin()
 
 
+    if window_size is not None:
+        force, start, end = windowed_signal(force, window_mid, window_size)
 
-    force, start, end = windowed_signal(force, window_mid, window_size)
+    if resolution is not None and isinstance(resolution, int) and resolution > 0:
 
+        # Interpolate to fixed length
+        x_original = np.linspace(0, 1, len(force))
+        x_new = np.linspace(0, 1, resolution)
+        force = np.interp(x_new, x_original, force)
 
+    else:
+        # If resolution is invalid, do not slice
+        force = force
 
     return force
 

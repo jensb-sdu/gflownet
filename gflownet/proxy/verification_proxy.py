@@ -1,11 +1,14 @@
 import torch
+from torchmetrics.clustering import CalinskiHarabaszScore, DunnIndex
+from torchmetrics.functional import f1_score as tm_f1_score
 from gflownet.envs.verification_env import VerificationEnv
 from gflownet.utils.verification_utils import ForceDataset, ForceDisplacementDataset
 from gflownet.proxy.base import Proxy
 from gflownet.utils.common import tfloat
 
 from sklearn.cluster import DBSCAN, HDBSCAN
-
+from sklearn.metrics import f1_score as sk_f1_score
+from sklearn.metrics import cohen_kappa_score
 import numpy as np
 
 class VerificationProxy(Proxy) :
@@ -23,21 +26,14 @@ class VerificationProxy(Proxy) :
         self.production_data = production_data
         self.alpha = alpha
         self.beta = beta
-        self.scoring_function = HDBSCAN_clustering_PCA
+        self.scoring_function = normalized_f1_score
+        # self.min_f1_score = 0.95  # Minimum acceptable F1 score for verification
 
-        self.min_f1_score = 0.95  # Minimum acceptable F1 score for verification
-
-        self.A = 100
-        self.B = 0
-        self.Q = 100 * self.min_f1_score
-        self.P = self.Q + (self.A-self.Q)/2
-        self.K = (self.A -self.Q) / (self.Q-self.B) ** (1/(self.P-self.Q))
-
-    
-        
-
-
-
+        # self.A = 100
+        # self.B = 0
+        # self.Q = 100 * self.min_f1_score
+        # self.P = self.Q + (self.A-self.Q)/2
+        # self.K = (self.A -self.Q) / (self.Q-self.B) ** (1/(self.P-self.Q))
 
     
     def setup(self, env: VerificationEnv = None):
@@ -50,7 +46,7 @@ class VerificationProxy(Proxy) :
         if self.production_data:
             self.dataset = ForceDisplacementDataset(directory=env.data_path, window_size=env.window_size )
         else:
-            self.dataset = ForceDataset(directory=env.data_path, window_size=env.window_size )
+            self.dataset = ForceDataset(directory=env.data_path, window_size=env.window_size, resolution=env.resolution)
         
         self.func_dict = env.funcidx2token
         
@@ -75,8 +71,9 @@ class VerificationProxy(Proxy) :
         # Move the force tensor to the proxy device and cast to working float dtype
         self.all_forces = self.all_forces.to(device=self.device, dtype=self.float)
 
-
-
+        # Calculate percentage of label 1 points
+        num_label_1 = (self.labels == 1).sum().item()
+        self.label_1_percentage = num_label_1 / self.labels.numel()
 
 
     def __call__(self, states):
@@ -87,14 +84,6 @@ class VerificationProxy(Proxy) :
         
         return output 
 
-
-    # def apply_functions(self, states: torch.TensorType):
-        
-    #     # state: ()
-    #     function_results = torch.zeros(states.shape[0], states.shape[1], len(self.dataset), device = self.device, dtype = self.float)
-        
-    #     # num_recordings, n_split, recording_len // n_split
-    #     segmented_data = self.dataset.segment_force_curves(n_splits=states.shape[1])
         
     def apply_functions(self, states: torch.Tensor):
         """
@@ -119,10 +108,10 @@ class VerificationProxy(Proxy) :
 
         # Move states to device and ensure integer indices
         states = states.to(device=self.device)
-        func_ids = states[:, :, 0].to(dtype=torch.long)
-        starts   = states[:, :, 1].to(dtype=torch.long)
-        ends     = states[:, :, 2].to(dtype=torch.long)
-
+        
+        starts   = states[:, :, 0].to(dtype=torch.long)
+        ends     = states[:, :, 1].to(dtype=torch.long)
+        func_ids = states[:, :, 2].to(dtype=torch.long)
         # Output: (num_states, max_functions, num_recordings)
         function_results = torch.zeros(
             num_states, max_functions, num_recordings,
@@ -168,7 +157,6 @@ class VerificationProxy(Proxy) :
         return function_results
  
 
-
     def get_score_by_group(self, grouped_data,
                         labels, 
                         alpha=1.0, 
@@ -200,8 +188,8 @@ class VerificationProxy(Proxy) :
                     alpha=alpha, 
                     beta=beta
                 )
-                # Soft plus to avoid zero scores
-                score = torch.log1p(torch.exp(score - self.min_f1_score))
+                # # Soft plus to avoid zero scores
+                #score = torch.log1p(torch.exp(score - self.min_f1_score))
 
                 individual_scores.append(score)
                 valid_groups.append(group_idx)
@@ -250,7 +238,7 @@ def rank_normalize(data):
             return normalized
 
 
-def IQR_normalize(data):
+def IQR_normalize(data : torch.TensorType) -> torch.TensorType:
     """
     Robust normalization using median and IQR.
     Robust to outliers and non-parametric distributions.
@@ -260,6 +248,13 @@ def IQR_normalize(data):
     Returns:
         Normalized data of shape [N, n]
     """
+
+    # Ensure data is tensor
+    data = torch.as_tensor(data, dtype=torch.float32)
+
+    # Ensure data is not mutated in-place
+    data = data.clone()
+
     median = torch.median(data, dim=0, keepdim=True)[0]  # [1, n]
 
     # Calculate IQR (Interquartile Range)
@@ -275,10 +270,59 @@ def IQR_normalize(data):
 
     return normalized
 
+def min_normalized_distance_score(coordinates: torch.TensorType, 
+                                  labels: torch.TensorType,
+                                  alpha: float,
+                                  beta: float) -> torch.TensorType:
+    """
+    Compute minimum normalized distance score between points with different labels.
+    """
+    normalized_coords = IQR_normalize(coordinates)
+    distances_between_classes = torch.cdist(normalized_coords[labels == 1], normalized_coords[labels == 0], p=2)
+    min_separation_distance = distances_between_classes.abs().min()
+    return min_separation_distance
+
+
+def norm_dunn_index_score(coordinates: torch.TensorType, 
+                    labels: torch.TensorType, 
+                    alpha: float, 
+                    beta: float) -> torch.TensorType:
+
+    normalized_coords = IQR_normalize(coordinates)
+    
+    distances_between_classes = torch.cdist(normalized_coords[labels == 1], normalized_coords[labels == 0], p=2)
+    min_separation_distance = distances_between_classes.abs().min()
+
+    # Compute intra-class distances
+    distances_within_class_1 = torch.cdist(normalized_coords[labels == 1], normalized_coords[labels == 1], p=2)
+    max_intra_class_distance = distances_within_class_1.abs().max()
+
+    # Compute Dunn index
+    dunn_index = min_separation_distance / (max_intra_class_distance + 1e-8)
+    return dunn_index
+
+
+def Calinski_Harabasz(coordinates: torch.TensorType, 
+                      labels: torch.TensorType) -> torch.TensorType:
+    """
+    Compute Calinski-Harabasz index.
+    """
+    normalized_points = IQR_normalize(coordinates)
+
+    # Between-cluster dispersion
+    between_dispersion = torch.cdist(normalized_points[labels == 1], normalized_points[labels == 0], p=2).abs().sum()
+
+    # Within-cluster dispersion
+    within_dispersion = torch.cdist(normalized_points[labels == 1], normalized_points[labels == 1], p=2).abs().sum()
+
+    ch_index = between_dispersion / (within_dispersion + 1e-8)
+    return ch_index
+
+
 
 def f1_score(coordinates: torch.TensorType, 
              labels, 
-             k=5):
+             k=10):
     """
     Compute F1 score using k-NN classification based on average distance to k nearest label
     
@@ -290,6 +334,8 @@ def f1_score(coordinates: torch.TensorType,
     Returns:
         f1_score: float tensor with F1 score
     """
+
+
 
     label_1_mask = labels == 1
 
@@ -307,22 +353,42 @@ def f1_score(coordinates: torch.TensorType,
     # This ensures all label 1 points are "inside" by definition
     threshold = avg_distance_to_label_1[label_1_mask].max()
     
-    # Add small margin to avoid numerical issues
-    threshold = threshold * 1.05
+    # Add 1 std deviation to threshold for some tolerance
+    threshold += avg_distance_to_label_1[label_1_mask].std()
     
     # Predict labels: points within threshold are predicted as label 1
     predicted_labels = (avg_distance_to_label_1 <= threshold).long()
+
+    f1 = tm_f1_score(predicted_labels, labels, task="binary")
     
-    # Calculate false positives and false negatives
-    false_positives = ((predicted_labels == 1) & (labels == 0)).sum().float()
-    false_negatives = ((predicted_labels == 0) & (labels == 1)).sum().float()
-    true_positives = ((predicted_labels == 1) & (labels == 1)).sum().float()
-
-
-    precision = true_positives / (true_positives + false_positives + 1e-8)
-    recall = true_positives / (true_positives + false_negatives + 1e-8)
-    f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+    # f1 = sk_f1_score(labels.cpu().numpy(), predicted_labels.cpu().numpy())
+    # f1 = torch.tensor(f1, device=coordinates.device, dtype=coordinates.dtype)
     return f1
+
+
+def normalized_f1_score(coordinates: torch.TensorType,
+                        labels: torch.TensorType,
+                        alpha=1.0,
+                        beta=1.0, 
+                        k=10) -> torch.TensorType:
+    """
+    Compute normalized F1 score using k-NN classification based on average distance to k nearest label 1 points.
+    """
+    f1 = f1_score(IQR_normalize(coordinates), labels, k=k)
+    return f1
+
+
+def f1_reciprocal_score(coordinates: torch.TensorType, 
+                        labels, 
+                        k=5,
+                        alpha=1.0, 
+                        beta=1.0):       
+    """
+    Compute reciprocal of F1 score using k-NN classification based on average distance to k nearest label 1 points.
+    """
+    f1 = f1_score(coordinates, labels, k=k)
+    return 1.0 / (1 - f1 + 1e-8) - 0.999
+
 
 
 def score_grouping_and_separation(coordinates: torch.TensorType, 
@@ -516,7 +582,7 @@ def score_dist_over_1_minus_f1(coordinates: torch.TensorType,
     Returns:
         Combined score defined as score = min_separation_distance / (1 - F1 score) (higher is better)
     """
-    normalized_coords = IQR_normalize(coordinates)
+    normalized_coords = IQR_normalize(coordinates.copy())
 
     f1 = f1_score(normalized_coords, labels, k=5)
 
@@ -718,3 +784,61 @@ def HDBSCAN_clustering_PCA(coordinates: torch.TensorType,
 
     return score
 
+# def feature_entropy_score(coordinates: torch.TensorType,
+#                           labels: torch.TensorType,
+#                           alpha=1.0,
+#                           beta=1.0):
+
+#     """
+#     Score based on feature entropy to identify uninformative dimensions.
+#     Args:
+#         coordinates: torch.Tensor of shape [N, n] with point coordinates
+#         labels: torch.Tensor of shape [N] with binary labels (0 or 1)
+#         alpha: dummy parameter for compatibility
+#         beta: dummy parameter for compatibility
+
+#     Returns:
+#         score: float, the computed feature entropy score
+#     """
+#     label_1
+
+
+
+#     return score
+
+def score_dist_over_1_minus_DBSCAN_f1(coordinates: torch.TensorType,
+                                labels,
+                                alpha=1.0,
+                                beta=1.0):
+    """
+    Score based on minimum separation distance divided by (1 - F1 score).
+    
+    Args:
+        coordinates: torch.Tensor of shape [N, n] with point coordinates
+        labels: torch.Tensor of shape [N] with binary labels (0 or 1)
+        alpha: dummy parameter for compatibility
+        beta: dummy parameter for compatibility
+        
+    Returns:
+        Combined score defined as score = min_separation_distance / (1 - F1 score) (higher is better)
+    """
+    normalized_coords = IQR_normalize(coordinates)
+
+    f1 = DBSCAN_clustering_PCA(normalized_coords, labels, eps=0.1, min_samples=5)
+
+
+    distances_between_classes = torch.cdist(normalized_coords[labels == 1], normalized_coords[labels == 0], p=2)
+
+    # Find minimum separation distance
+    min_separation_distance = distances_between_classes.abs().min()
+
+
+
+
+    combined_score = min_separation_distance / (1.0 - f1 + 1e-8)
+
+    # clamp to avoid extreme values
+    combined_score = torch.clamp(combined_score, min=0.0, max=1e6)
+
+
+    return combined_score
